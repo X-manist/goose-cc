@@ -38,6 +38,16 @@
               }
             }
           },
+          "404": {
+            "description": "Tool confirmation request was not found or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized - invalid secret key"
           },
@@ -5450,7 +5460,11 @@
           "auto",
           "approve",
           "smart_approve",
-          "chat"
+          "chat",
+          "readonly",
+          "guarded",
+          "standard",
+          "yolo"
         ]
       },
       "HfGgufFile": {
@@ -9070,7 +9084,11 @@
         ],
         "properties": {
           "goose_mode": {
-            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GooseMode"
+              }
+            ],
             "nullable": true
           },
           "session_id": {

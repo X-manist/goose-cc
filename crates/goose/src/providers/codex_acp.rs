@@ -85,9 +85,13 @@ impl ProviderDef for CodexAcpProvider {
             // Chat and Approve both map to "read-only".
             let mode_mapping = HashMap::from([
                 (GooseMode::Auto, "full-access".to_string()),
+                (GooseMode::Yolo, "full-access".to_string()),
                 (GooseMode::Approve, "read-only".to_string()),
+                (GooseMode::Standard, "read-only".to_string()),
                 (GooseMode::SmartApprove, "auto".to_string()),
+                (GooseMode::Guarded, "auto".to_string()),
                 (GooseMode::Chat, "read-only".to_string()),
+                (GooseMode::Readonly, "read-only".to_string()),
             ]);
 
             let provider_config = AcpProviderConfig {
@@ -125,11 +129,14 @@ impl ProviderDef for CodexAcpProvider {
 // sandbox are auto-approved, operations outside it trigger on-request prompts.
 // So Approve uses read-only sandbox to force write approvals through goose.
 fn map_goose_mode(goose_mode: GooseMode) -> (&'static str, &'static str) {
-    match goose_mode {
+    match goose_mode.effective_mode() {
         GooseMode::Auto => ("never", "danger-full-access"),
         GooseMode::SmartApprove => ("on-request", "workspace-write"),
         GooseMode::Approve => ("on-request", "read-only"),
-        GooseMode::Chat => ("never", "read-only"),
+        GooseMode::Chat | GooseMode::Readonly => ("never", "read-only"),
+        GooseMode::Guarded | GooseMode::Standard | GooseMode::Yolo => {
+            unreachable!("codex acp should match on effective goose mode")
+        }
     }
 }
 
@@ -142,6 +149,10 @@ mod tests {
     #[test_case(GooseMode::SmartApprove, "on-request", "workspace-write")]
     #[test_case(GooseMode::Approve, "on-request", "read-only")]
     #[test_case(GooseMode::Chat, "never", "read-only")]
+    #[test_case(GooseMode::Readonly, "never", "read-only")]
+    #[test_case(GooseMode::Guarded, "on-request", "workspace-write")]
+    #[test_case(GooseMode::Standard, "on-request", "read-only")]
+    #[test_case(GooseMode::Yolo, "never", "danger-full-access")]
     fn test_map_goose_mode(mode: GooseMode, expected_approval: &str, expected_sandbox: &str) {
         let (approval, sandbox) = map_goose_mode(mode);
         assert_eq!(approval, expected_approval);

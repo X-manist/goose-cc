@@ -1,3 +1,4 @@
+pub mod agent_import;
 pub mod configure;
 pub mod doctor;
 pub mod gateway;

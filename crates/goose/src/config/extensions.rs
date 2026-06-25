@@ -138,7 +138,7 @@ pub fn set_extension(entry: ExtensionEntry) {
     set_extension_with_config(Config::global(), entry);
 }
 
-fn set_extension_with_config(config: &Config, entry: ExtensionEntry) {
+pub(crate) fn set_extension_with_config(config: &Config, entry: ExtensionEntry) {
     let key = entry.config.key();
     with_raw_extensions_mapping(config, |_| ExtensionMutation::Upsert(key, Box::new(entry)));
 }

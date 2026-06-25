@@ -14,7 +14,9 @@ use super::container::Container;
 use super::final_output_tool::FinalOutputTool;
 use super::mcp_client::GooseMcpHostInfo;
 use super::platform_tools;
-use super::tool_confirmation_router::ToolConfirmationRouter;
+use super::tool_confirmation_router::{
+    deliver_delegated_tool_confirmation, ToolConfirmationRouter,
+};
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::action_required_manager::ActionRequiredManager;
 use crate::agents::extension::{ExtensionConfig, ExtensionResult, ToolInfo};
@@ -26,6 +28,7 @@ use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::retry::{RetryManager, RetryResult};
+use crate::agents::subagent_handler::SUBAGENT_TOOL_CONFIRMATION_TYPE;
 use crate::agents::types::{FrontendTool, SessionConfig, SharedProvider, ToolResultReceiver};
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
@@ -117,6 +120,45 @@ fn stop_hook_denial_notification(plugin: &str) -> Message {
     Message::assistant().with_system_notification(
         SystemNotificationType::InlineMessage,
         format!("Stop hook `{plugin}` blocked ending this turn."),
+    )
+}
+
+fn subagent_tool_confirmation_message(
+    request_id: &str,
+    notification: &ServerNotification,
+) -> Option<Message> {
+    let ServerNotification::LoggingMessageNotification(log_notif) = notification else {
+        return None;
+    };
+    let data = log_notif.params.data.as_object()?;
+    if data.get("type").and_then(|v| v.as_str()) != Some(SUBAGENT_TOOL_CONFIRMATION_TYPE) {
+        return None;
+    }
+    let parent_tool_request_id = data.get("parent_tool_request_id")?.as_str()?;
+    if parent_tool_request_id != request_id {
+        return None;
+    }
+    let id = data.get("id")?.as_str()?.to_string();
+    let subagent_id = data
+        .get("subagent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let tool_name = data.get("tool_name")?.as_str()?.to_string();
+    let arguments = data
+        .get("arguments")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let prompt = data
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(|prompt| format!("Subagent `{subagent_id}` requests approval:\n\n{prompt}"))
+        .or_else(|| Some(format!("Subagent `{subagent_id}` requests approval.")));
+
+    Some(
+        Message::assistant()
+            .with_action_required(id, tool_name, arguments, prompt)
+            .user_only(),
     )
 }
 
@@ -502,6 +544,11 @@ impl Agent {
     ) -> ToolCallResult {
         let hook_manager = self.hook_manager.clone();
         let session_id = session.id.clone();
+        let artifact_root = self
+            .config
+            .session_manager
+            .artifact_dir(&session_id)
+            .join("tool_outputs");
         let working_dir = session.working_dir.to_string_lossy().to_string();
         let tool_name = tool_call.name.to_string();
         let tool_input = tool_call
@@ -511,8 +558,12 @@ impl Agent {
         let category = categorize_tool(&tool_name);
 
         let fut = async move {
-            let processed_result =
-                super::large_response_handler::process_tool_response(result.result.await);
+            let processed_result = super::large_response_handler::process_tool_response(
+                &artifact_root,
+                &session_id,
+                &tool_name,
+                result.result.await,
+            );
             let event = match &processed_result {
                 Ok(call_result) if call_result.is_error != Some(true) => {
                     crate::hooks::HookEvent::PostToolUse
@@ -683,7 +734,7 @@ impl Agent {
 
         let goose_mode = *self.current_goose_mode.lock().await;
 
-        if goose_mode == GooseMode::SmartApprove {
+        if goose_mode.is_smart_approve() || goose_mode.effective_mode() == GooseMode::Readonly {
             self.tool_inspection_manager.apply_tool_annotations(&tools);
         }
 
@@ -1215,6 +1266,81 @@ impl Agent {
         results
     }
 
+    /// Restore the active extension set to match a session exactly.
+    /// This is used by interactive in-process resume where the CLI already owns
+    /// a direct `Agent` value instead of an `Arc<Agent>`.
+    pub async fn restore_extensions_from_session(
+        &self,
+        session: &Session,
+    ) -> Vec<ExtensionLoadResult> {
+        let session_extensions =
+            EnabledExtensionsState::from_extension_data(&session.extension_data);
+        let enabled_configs = match session_extensions {
+            Some(state) => state.extensions,
+            None => {
+                tracing::warn!(
+                    "No extensions found in session {}. This is unexpected.",
+                    session.id
+                );
+                return vec![];
+            }
+        };
+
+        let desired_names: std::collections::HashSet<String> =
+            enabled_configs.iter().map(|config| config.name()).collect();
+        for name in self.list_extensions().await {
+            if !desired_names.contains(&name) {
+                if let Err(e) = self.extension_manager.remove_extension(&name).await {
+                    warn!("Failed to remove stale extension {}: {}", name, e);
+                }
+                self.remove_frontend_extension(&name).await;
+            }
+        }
+
+        let mut results = Vec::new();
+        for config in enabled_configs {
+            let name = config.name().to_string();
+            if self.extension_manager.is_extension_enabled(&name).await
+                || self.frontend_extensions.lock().await.contains_key(&name)
+            {
+                results.push(ExtensionLoadResult {
+                    name,
+                    success: true,
+                    error: None,
+                });
+                continue;
+            }
+
+            match self.add_extension_inner(config, &session.id).await {
+                Ok(_) => results.push(ExtensionLoadResult {
+                    name,
+                    success: true,
+                    error: None,
+                }),
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    warn!("Failed to restore extension {}: {}", name, error_msg);
+                    results.push(ExtensionLoadResult {
+                        name,
+                        success: false,
+                        error: Some(error_msg),
+                    });
+                }
+            }
+        }
+
+        if results.iter().any(|r| r.success) {
+            if let Err(e) = self.persist_extension_state(&session.id).await {
+                warn!(
+                    "Failed to persist extension state after session restore: {}",
+                    e
+                );
+            }
+        }
+
+        results
+    }
+
     pub async fn add_extension(
         &self,
         extension: ExtensionConfig,
@@ -1403,9 +1529,15 @@ impl Agent {
     /// Handle a confirmation response for a tool request
     pub async fn handle_confirmation(
         &self,
+        session_id: &str,
         request_id: String,
         confirmation: PermissionConfirmation,
-    ) {
+    ) -> bool {
+        if deliver_delegated_tool_confirmation(session_id, &request_id, confirmation.clone()).await
+        {
+            return true;
+        }
+
         let provider = self.provider.lock().await.clone();
         if let Some(provider) = provider.as_ref() {
             if provider.permission_routing() == PermissionRouting::ActionRequired
@@ -1413,15 +1545,18 @@ impl Agent {
                     .handle_permission_confirmation(&request_id, &confirmation)
                     .await
             {
-                return;
+                return true;
             }
         }
-        if !self
+        if self
             .tool_confirmation_router
             .deliver(request_id, confirmation)
             .await
         {
+            true
+        } else {
             error!("Failed to deliver confirmation");
+            false
         }
     }
 
@@ -1953,7 +2088,7 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
                                 }
-                                if goose_mode == GooseMode::Chat {
+                                if goose_mode.is_chat_only() {
                                     for request in remaining_requests.iter() {
                                         if let Some(response) = request_to_response_map.get_mut(&request.id) {
                                             response.add_tool_response_with_metadata(
@@ -2076,7 +2211,11 @@ impl Agent {
                                                                 }
                                                             }
                                                             ToolStreamItem::Message(msg) => {
-                                                                yield AgentEvent::McpNotification((request_id, msg));
+                                                                if let Some(action_required_msg) = subagent_tool_confirmation_message(&request_id, &msg) {
+                                                                    yield AgentEvent::Message(action_required_msg);
+                                                                } else {
+                                                                    yield AgentEvent::McpNotification((request_id, msg));
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -3065,6 +3204,7 @@ mod tests {
     use crate::providers::base::{stream_from_single_message, MessageStream, PermissionRouting};
     use crate::recipe::Response;
     use crate::session::session_manager::SessionType;
+    use futures::TryStreamExt;
     use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
     use rmcp::model::Tool;
     use std::path::PathBuf;
@@ -3131,15 +3271,18 @@ mod tests {
             Some(provider.clone() as Arc<dyn crate::providers::base::Provider>);
 
         // Known request_id → provider handles it, confirmation_router NOT called
-        agent
-            .handle_confirmation(
-                "known".to_string(),
-                PermissionConfirmation {
-                    principal_type: PrincipalType::Tool,
-                    permission: crate::permission::Permission::AllowOnce,
-                },
-            )
-            .await;
+        assert!(
+            agent
+                .handle_confirmation(
+                    "session_test",
+                    "known".to_string(),
+                    PermissionConfirmation {
+                        principal_type: PrincipalType::Tool,
+                        permission: crate::permission::Permission::AllowOnce,
+                    },
+                )
+                .await
+        );
         assert_eq!(provider.handled.lock().await.len(), 1);
 
         // Unknown request_id → provider returns false, falls through to confirmation_router
@@ -3148,15 +3291,18 @@ mod tests {
             .tool_confirmation_router
             .register("unknown".to_string())
             .await;
-        agent
-            .handle_confirmation(
-                "unknown".to_string(),
-                PermissionConfirmation {
-                    principal_type: PrincipalType::Tool,
-                    permission: crate::permission::Permission::DenyOnce,
-                },
-            )
-            .await;
+        assert!(
+            agent
+                .handle_confirmation(
+                    "session_test",
+                    "unknown".to_string(),
+                    PermissionConfirmation {
+                        principal_type: PrincipalType::Tool,
+                        permission: crate::permission::Permission::DenyOnce,
+                    },
+                )
+                .await
+        );
         assert_eq!(provider.handled.lock().await.len(), 2);
         // Verify the fallthrough went to confirmation_router
         let conf = rx.await.unwrap();
@@ -3172,18 +3318,96 @@ mod tests {
             .tool_confirmation_router
             .register("any".to_string())
             .await;
-        agent
-            .handle_confirmation(
-                "any".to_string(),
-                PermissionConfirmation {
-                    principal_type: PrincipalType::Tool,
-                    permission: crate::permission::Permission::AllowOnce,
-                },
-            )
-            .await;
+        assert!(
+            agent
+                .handle_confirmation(
+                    "session_test",
+                    "any".to_string(),
+                    PermissionConfirmation {
+                        principal_type: PrincipalType::Tool,
+                        permission: crate::permission::Permission::AllowOnce,
+                    },
+                )
+                .await
+        );
 
         let conf = rx.await.unwrap();
         assert_eq!(conf.permission, crate::permission::Permission::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn test_handle_confirmation_reports_missing_request() {
+        let agent = Agent::new();
+        assert!(
+            !agent
+                .handle_confirmation(
+                    "session_test",
+                    "missing".to_string(),
+                    PermissionConfirmation {
+                        principal_type: PrincipalType::Tool,
+                        permission: crate::permission::Permission::AllowOnce,
+                    },
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subagent_approval_requests_wait_for_confirmation() {
+        let agent = Agent::new();
+        let request = ToolRequest {
+            id: "req-approval".to_string(),
+            tool_call: Ok(CallToolRequestParams::new("developer__shell")),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut tool_futures = Vec::new();
+        let mut request_to_response_map = HashMap::from([(request.id.clone(), Message::user())]);
+        let session = Session {
+            session_type: SessionType::SubAgent,
+            ..Session::default()
+        };
+
+        let mut stream = agent.handle_approval_tool_requests(
+            std::slice::from_ref(&request),
+            &mut tool_futures,
+            &mut request_to_response_map,
+            None,
+            &session,
+            &[],
+        );
+        let action_required = stream
+            .try_next()
+            .await
+            .unwrap()
+            .expect("expected action required message");
+        let action = action_required
+            .content
+            .iter()
+            .find_map(|content| content.as_action_required())
+            .expect("expected action required content");
+        assert!(matches!(
+            &action.data,
+            ActionRequiredData::ToolConfirmation { id, .. } if id == "req-approval"
+        ));
+
+        assert!(
+            agent
+                .handle_confirmation(
+                    "session_test",
+                    "req-approval".to_string(),
+                    PermissionConfirmation {
+                        principal_type: PrincipalType::Tool,
+                        permission: crate::permission::Permission::AllowOnce,
+                    },
+                )
+                .await
+        );
+
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+
+        assert_eq!(tool_futures.len(), 1);
     }
 
     const ALWAYS_BLOCK_SCRIPT: &str = r#"#!/bin/sh

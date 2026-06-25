@@ -1,5 +1,5 @@
 use crate::agents::ExtensionConfig;
-use crate::config::Config;
+use crate::config::{Config, GooseMode};
 use crate::providers::base::Provider;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ pub struct TaskConfig {
     pub parent_working_dir: PathBuf,
     pub extensions: Vec<ExtensionConfig>,
     pub max_turns: Option<usize>,
+    pub goose_mode: GooseMode,
 }
 
 impl fmt::Debug for TaskConfig {
@@ -25,6 +26,7 @@ impl fmt::Debug for TaskConfig {
             .field("parent_session_id", &self.parent_session_id)
             .field("parent_working_dir", &self.parent_working_dir)
             .field("max_turns", &self.max_turns)
+            .field("goose_mode", &self.goose_mode)
             .field("extensions", &self.extensions)
             .finish()
     }
@@ -47,6 +49,7 @@ impl TaskConfig {
                     .get_param::<usize>("GOOSE_SUBAGENT_MAX_TURNS")
                     .unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS),
             ),
+            goose_mode: GooseMode::Readonly,
         }
     }
 
@@ -54,6 +57,11 @@ impl TaskConfig {
         if let Some(turns) = max_turns {
             self.max_turns = Some(turns);
         }
+        self
+    }
+
+    pub fn with_goose_mode(mut self, goose_mode: GooseMode) -> Self {
+        self.goose_mode = goose_mode;
         self
     }
 }

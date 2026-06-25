@@ -1,8 +1,7 @@
 use crate::config::Config;
-use chrono::Utc;
+use goose_context_core::ContextCompressor;
 use rmcp::model::{CallToolResult, Content, ErrorData};
-use std::fs::File;
-use std::io::Write;
+use std::path::Path;
 
 const DEFAULT_LARGE_TEXT_THRESHOLD: usize = 200_000;
 
@@ -14,6 +13,9 @@ fn large_text_threshold() -> usize {
 
 /// Process tool response and handle large text content
 pub fn process_tool_response(
+    artifact_root: &Path,
+    session_id: &str,
+    tool_name: &str,
     response: Result<CallToolResult, ErrorData>,
 ) -> Result<CallToolResult, ErrorData> {
     let threshold = large_text_threshold();
@@ -26,16 +28,14 @@ pub fn process_tool_response(
                     Some(text_content) => {
                         // Check if text exceeds threshold
                         if text_content.text.chars().count() > threshold {
-                            // Write to temp file
-                            match write_large_text_to_file(&text_content.text) {
-                                Ok(file_path) => {
-                                    // Create a new text content with reference to the file
-                                    let message = format!(
-                                        "The response returned from the tool call was larger ({} characters) and is stored in the file which you can use other tools to examine or search in: {}",
-                                        text_content.text.chars().count(),
-                                        file_path
-                                    );
-                                    processed_contents.push(Content::text(message));
+                            let compressor = ContextCompressor::new(artifact_root);
+                            match compressor.compress_large_text(
+                                session_id,
+                                tool_name,
+                                &text_content.text,
+                            ) {
+                                Ok(compact) => {
+                                    processed_contents.push(Content::text(compact.summary));
                                 }
                                 Err(e) => {
                                     // If file writing fails, include original content with warning
@@ -66,24 +66,6 @@ pub fn process_tool_response(
     }
 }
 
-/// Write large text content to a temporary file
-fn write_large_text_to_file(content: &str) -> Result<String, std::io::Error> {
-    // Create temp directory if it doesn't exist
-    let temp_dir = std::env::temp_dir().join("goose_mcp_responses");
-    std::fs::create_dir_all(&temp_dir)?;
-
-    // Generate a unique filename with timestamp
-    let timestamp = Utc::now().format("%Y%m%d_%H%M%S%.6f");
-    let filename = format!("mcp_response_{}.txt", timestamp);
-    let file_path = temp_dir.join(&filename);
-
-    // Write content to file
-    let mut file = File::create(&file_path)?;
-    file.write_all(content.as_bytes())?;
-
-    Ok(file_path.to_string_lossy().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,8 +74,13 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    fn artifact_root() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn test_small_text_response_passes_through() {
+        let artifact_root = artifact_root();
         // Create a small text response
         let small_text = "This is a small text response";
         let content = Content::text(small_text.to_string());
@@ -101,7 +88,9 @@ mod tests {
         let response = Ok(CallToolResult::success(vec![content]));
 
         // Process the response
-        let processed = process_tool_response(response).unwrap();
+        let processed =
+            process_tool_response(artifact_root.path(), "test-session", "test_tool", response)
+                .unwrap();
 
         // Verify the response is unchanged
         assert_eq!(processed.content.len(), 1);
@@ -114,6 +103,7 @@ mod tests {
 
     #[test]
     fn test_large_text_response_redirected_to_file() {
+        let artifact_root = artifact_root();
         // Create a text larger than the threshold
         let large_text = "a".repeat(DEFAULT_LARGE_TEXT_THRESHOLD + 1000);
         let content = Content::text(large_text.clone());
@@ -121,18 +111,21 @@ mod tests {
         let response = Ok(CallToolResult::success(vec![content]));
 
         // Process the response
-        let processed = process_tool_response(response).unwrap();
+        let processed =
+            process_tool_response(artifact_root.path(), "test-session", "test_tool", response)
+                .unwrap();
 
         // Verify the response contains a message about the file
         assert_eq!(processed.content.len(), 1);
         if let Some(text_content) = processed.content[0].as_text() {
             assert!(text_content
                 .text
-                .contains("The response returned from the tool call was larger"));
-            assert!(text_content.text.contains("characters"));
+                .contains("Tool output from `test_tool` was large"));
+            assert!(text_content.text.contains("chars:"));
 
             // Extract the file path from the message
-            if let Some(file_path) = text_content.text.split("stored in the file: ").nth(1) {
+            if let Some(file_path) = text_content.text.split("artifact_path: ").nth(1) {
+                let file_path = file_path.lines().next().unwrap_or_default();
                 // Verify the file exists and contains the original text
                 let path = Path::new(file_path.trim());
                 if path.exists() {
@@ -152,13 +145,16 @@ mod tests {
 
     #[test]
     fn test_image_content_passes_through() {
+        let artifact_root = artifact_root();
         // Create an image content
         let image_content = Content::image("base64data".to_string(), "image/png".to_string());
 
         let response = Ok(CallToolResult::success(vec![image_content]));
 
         // Process the response
-        let processed = process_tool_response(response).unwrap();
+        let processed =
+            process_tool_response(artifact_root.path(), "test-session", "test_tool", response)
+                .unwrap();
 
         // Verify the response is unchanged
         assert_eq!(processed.content.len(), 1);
@@ -172,6 +168,7 @@ mod tests {
 
     #[test]
     fn test_mixed_content_handled_correctly() {
+        let artifact_root = artifact_root();
         // Create a response with mixed content types
         let small_text = Content::text("Small text");
         let large_text = Content::text("a".repeat(DEFAULT_LARGE_TEXT_THRESHOLD + 1000));
@@ -180,7 +177,9 @@ mod tests {
         let response = Ok(CallToolResult::success(vec![small_text, large_text, image]));
 
         // Process the response
-        let processed = process_tool_response(response).unwrap();
+        let processed =
+            process_tool_response(artifact_root.path(), "test-session", "test_tool", response)
+                .unwrap();
 
         // Verify each item is handled correctly
         assert_eq!(processed.content.len(), 3);
@@ -196,10 +195,11 @@ mod tests {
         if let Some(text_content) = processed.content[1].as_text() {
             assert!(text_content
                 .text
-                .contains("The response returned from the tool call was larger"));
+                .contains("Tool output from `test_tool` was large"));
 
             // Extract the file path and clean up
-            if let Some(file_path) = text_content.text.split("stored in the file: ").nth(1) {
+            if let Some(file_path) = text_content.text.split("artifact_path: ").nth(1) {
+                let file_path = file_path.lines().next().unwrap_or_default();
                 let path = Path::new(file_path.trim());
                 if path.exists() {
                     let _ = fs::remove_file(path); // Ignore errors on cleanup
@@ -220,6 +220,7 @@ mod tests {
 
     #[test]
     fn test_error_response_passes_through() {
+        let artifact_root = artifact_root();
         // Create an error response
         let error = ErrorData {
             code: ErrorCode::INTERNAL_ERROR,
@@ -229,7 +230,8 @@ mod tests {
         let response: Result<CallToolResult, ErrorData> = Err(error);
 
         // Process the response
-        let processed = process_tool_response(response);
+        let processed =
+            process_tool_response(artifact_root.path(), "test-session", "test_tool", response);
 
         // Verify the error is passed through unchanged
         assert!(processed.is_err());

@@ -287,6 +287,12 @@
   "configureApproveMode.description": {
     "defaultMessage": "Approve requests can either be given to all tool requests or determine which actions may need integration"
   },
+  "configureApproveMode.guardedApproval": {
+    "defaultMessage": "Guarded"
+  },
+  "configureApproveMode.guardedApprovalDescription": {
+    "defaultMessage": "Allow clearly safe reads and ask before sensitive actions."
+  },
   "configureApproveMode.manualApproval": {
     "defaultMessage": "Manual approval"
   },
@@ -304,6 +310,12 @@
   },
   "configureApproveMode.smartApprovalDescription": {
     "defaultMessage": "Intelligently determine which actions need approval based on risk level"
+  },
+  "configureApproveMode.standardApproval": {
+    "defaultMessage": "Standard"
+  },
+  "configureApproveMode.standardApprovalDescription": {
+    "defaultMessage": "Ask before every tool call."
   },
   "configureApproveMode.title": {
     "defaultMessage": "Configure approve mode"
@@ -2210,17 +2222,56 @@
   "modeSelectionItem.chatOnlyLabel": {
     "defaultMessage": "Chat only"
   },
+  "modeSelectionItem.configureRules": {
+    "defaultMessage": "Configure permission rules for {mode}"
+  },
+  "modeSelectionItem.guardedDescription": {
+    "defaultMessage": "Allow clearly safe reads and ask before sensitive actions."
+  },
+  "modeSelectionItem.guardedLabel": {
+    "defaultMessage": "Guarded"
+  },
   "modeSelectionItem.manualDescription": {
     "defaultMessage": "All tools, extensions and file modifications will require human approval"
   },
   "modeSelectionItem.manualLabel": {
     "defaultMessage": "Manual"
   },
+  "modeSelectionItem.readonlyDescription": {
+    "defaultMessage": "Only read-only tools can run without modifying files or system state."
+  },
+  "modeSelectionItem.readonlyLabel": {
+    "defaultMessage": "Read-only"
+  },
   "modeSelectionItem.smartDescription": {
     "defaultMessage": "Intelligently determine which actions need approval based on risk level"
   },
   "modeSelectionItem.smartLabel": {
     "defaultMessage": "Smart"
+  },
+  "modeSelectionItem.standardDescription": {
+    "defaultMessage": "Ask before every tool call."
+  },
+  "modeSelectionItem.standardLabel": {
+    "defaultMessage": "Standard"
+  },
+  "modeSelectionItem.yoloDescription": {
+    "defaultMessage": "Approve tool calls without prompts. Use only in isolated worktrees."
+  },
+  "modeSelectionItem.yoloLabel": {
+    "defaultMessage": "Unrestricted"
+  },
+  "modeSection.compatibilityModes": {
+    "defaultMessage": "Compatibility modes"
+  },
+  "modeSection.compatibilityModesDescription": {
+    "defaultMessage": "Older mode names remain available for existing workflows."
+  },
+  "modeSection.permissionProfiles": {
+    "defaultMessage": "Permission profiles"
+  },
+  "modeSection.permissionProfilesDescription": {
+    "defaultMessage": "Choose how Goose handles reads, writes, execution, and approval prompts."
   },
   "modelAndProviderContext.modelChangeFailed": {
     "defaultMessage": "{provider}/{model} failed"
@@ -2643,7 +2694,7 @@
     "defaultMessage": "Permission Rules"
   },
   "permissionSetting.permissionRulesDescription": {
-    "defaultMessage": "Hidden instructions that will be passed to the provider to help direct and add context to your responses."
+    "defaultMessage": "Control which tools and extensions may read, write, execute, or require approval."
   },
   "privacyInfoModal.collectErrors": {
     "defaultMessage": "Error types (e.g., \"rate_limit\", \"auth\" - no details)"
@@ -4504,6 +4555,12 @@
   },
   "toolApprovalButtons.allowOnce": {
     "defaultMessage": "Allow Once"
+  },
+  "toolApprovalButtons.approvalFailed": {
+    "defaultMessage": "Approval could not be delivered. The request may have expired. Try rerunning the action."
+  },
+  "toolApprovalButtons.approving": {
+    "defaultMessage": "Approving..."
   },
   "toolApprovalButtons.allowedOnce": {
     "defaultMessage": "Allowed once"

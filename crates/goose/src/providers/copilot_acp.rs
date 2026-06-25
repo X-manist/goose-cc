@@ -73,9 +73,13 @@ impl ProviderDef for CopilotAcpProvider {
             // No approve-specific mode; permissions are handled separately.
             let mode_mapping = HashMap::from([
                 (GooseMode::Auto, MODE_AGENT.to_string()),
+                (GooseMode::Yolo, MODE_AGENT.to_string()),
                 (GooseMode::Approve, MODE_AGENT.to_string()),
+                (GooseMode::Standard, MODE_AGENT.to_string()),
                 (GooseMode::SmartApprove, MODE_AGENT.to_string()),
+                (GooseMode::Guarded, MODE_AGENT.to_string()),
                 (GooseMode::Chat, MODE_PLAN.to_string()),
+                (GooseMode::Readonly, MODE_PLAN.to_string()),
             ]);
 
             let provider_config = AcpProviderConfig {

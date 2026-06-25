@@ -524,8 +524,9 @@ impl ProviderFixture {
         label: &str,
     ) -> Result<()> {
         let message = Message::user().with_text(message);
+        let session_id = self.session_id.clone();
         let session_config = SessionConfig {
-            id: self.session_id.clone(),
+            id: session_id.clone(),
             schedule_id: None,
             max_turns: Some(5),
             retry_config: None,
@@ -543,6 +544,7 @@ impl ProviderFixture {
                             saw_action_required = true;
                             self.agent
                                 .handle_confirmation(
+                                    &session_id,
                                     id.clone(),
                                     PermissionConfirmation {
                                         principal_type: PrincipalType::Tool,

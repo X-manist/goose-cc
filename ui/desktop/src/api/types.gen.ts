@@ -540,7 +540,7 @@ export type GooseApp = McpAppResource & (WindowProps | null) & {
     prd?: string | null;
 };
 
-export type GooseMode = 'auto' | 'approve' | 'smart_approve' | 'chat';
+export type GooseMode = 'auto' | 'approve' | 'smart_approve' | 'chat' | 'readonly' | 'guarded' | 'standard' | 'yolo';
 
 /**
  * A single downloadable GGUF file (used internally and for downloads).
@@ -1709,7 +1709,7 @@ export type UpdateSessionNameRequest = {
 };
 
 export type UpdateSessionRequest = {
-    goose_mode?: string | null;
+    goose_mode?: GooseMode | null;
     session_id: string;
 };
 
@@ -1782,10 +1782,16 @@ export type ConfirmToolActionErrors = {
      */
     401: unknown;
     /**
+     * Tool confirmation request was not found or expired
+     */
+    404: ErrorResponse;
+    /**
      * Internal server error
      */
     500: unknown;
 };
+
+export type ConfirmToolActionError = ConfirmToolActionErrors[keyof ConfirmToolActionErrors];
 
 export type ConfirmToolActionResponses = {
     /**

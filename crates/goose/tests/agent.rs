@@ -436,8 +436,9 @@ mod tests {
 
             agent.update_provider(provider, &session.id).await?;
 
+            let session_id = session.id.clone();
             let session_config = SessionConfig {
-                id: session.id,
+                id: session_id.clone(),
                 schedule_id: None,
                 max_turns: Some(1),
                 retry_config: None,
@@ -455,6 +456,7 @@ mod tests {
                         {
                             if let goose::conversation::message::ActionRequiredData::ToolConfirmation { id, .. } = &action.data {
                                 agent.handle_confirmation(
+                                    &session_id,
                                     id.clone(),
                                     goose::permission::PermissionConfirmation {
                                         principal_type: goose::permission::permission_confirmation::PrincipalType::Tool,

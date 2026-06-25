@@ -36,6 +36,15 @@ const i18n = defineMessages({
     id: 'toolApprovalButtons.cancelled',
     defaultMessage: 'Cancelled',
   },
+  approving: {
+    id: 'toolApprovalButtons.approving',
+    defaultMessage: 'Approving...',
+  },
+  approvalFailed: {
+    id: 'toolApprovalButtons.approvalFailed',
+    defaultMessage:
+      'Approval could not be delivered. The request may have expired. Try rerunning the action.',
+  },
 });
 
 const globalApprovalState = new Map<
@@ -43,6 +52,7 @@ const globalApprovalState = new Map<
   {
     decision: Permission | null;
     isClicked: boolean;
+    errorMessage: string | null;
   }
 >();
 
@@ -61,22 +71,38 @@ export default function ToolApprovalButtons({ data }: { data: ToolApprovalData }
   const storedState = globalApprovalState.get(id);
   const [decision, setDecision] = useState<Permission | null>(storedState?.decision ?? null);
   const [isClicked, setIsClicked] = useState(storedState?.isClicked ?? initialIsClicked ?? false);
+  const [pendingAction, setPendingAction] = useState<Permission | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(
+    storedState?.errorMessage ?? null
+  );
 
   useEffect(() => {
     const currentState = globalApprovalState.get(id);
     if (currentState) {
       setDecision(currentState.decision);
       setIsClicked(currentState.isClicked);
+      setErrorMessage(currentState.errorMessage);
+      setPendingAction(null);
     }
   }, [id]);
 
   useEffect(() => {
-    globalApprovalState.set(id, { decision, isClicked });
-  }, [id, decision, isClicked]);
+    globalApprovalState.set(id, { decision, isClicked, errorMessage });
+  }, [id, decision, isClicked, errorMessage]);
+
+  const approvalErrorText = (error: unknown): string => {
+    if (error && typeof error === 'object' && 'message' in error) {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === 'string' && message.trim()) {
+        return message;
+      }
+    }
+    return intl.formatMessage(i18n.approvalFailed);
+  };
 
   const handleAction = async (action: Permission) => {
-    setDecision(action);
-    setIsClicked(true);
+    setPendingAction(action);
+    setErrorMessage(null);
 
     try {
       const response = await confirmToolAction({
@@ -88,10 +114,17 @@ export default function ToolApprovalButtons({ data }: { data: ToolApprovalData }
         },
       });
       if (response.error) {
-        console.error('Failed to confirm tool action:', response.error);
+        throw response.error;
       }
+      setDecision(action);
+      setIsClicked(true);
     } catch (err) {
       console.error('Error confirming tool action:', err);
+      setDecision(null);
+      setIsClicked(false);
+      setErrorMessage(approvalErrorText(err));
+    } finally {
+      setPendingAction(null);
     }
   };
 
@@ -111,26 +144,46 @@ export default function ToolApprovalButtons({ data }: { data: ToolApprovalData }
   }
 
   return (
-    <div className="flex items-center gap-2 mt-2">
-      <Button
-        className="rounded-full"
-        variant="secondary"
-        onClick={() => handleAction('allow_once')}
-      >
-        {intl.formatMessage(i18n.allowOnce)}
-      </Button>
-      {!prompt && (
+    <div className="mt-2">
+      <div className="flex items-center gap-2">
         <Button
           className="rounded-full"
           variant="secondary"
-          onClick={() => handleAction('always_allow')}
+          disabled={pendingAction !== null}
+          onClick={() => handleAction('allow_once')}
         >
-          {intl.formatMessage(i18n.alwaysAllow)}
+          {pendingAction === 'allow_once'
+            ? intl.formatMessage(i18n.approving)
+            : intl.formatMessage(i18n.allowOnce)}
         </Button>
+        {!prompt && (
+          <Button
+            className="rounded-full"
+            variant="secondary"
+            disabled={pendingAction !== null}
+            onClick={() => handleAction('always_allow')}
+          >
+            {pendingAction === 'always_allow'
+              ? intl.formatMessage(i18n.approving)
+              : intl.formatMessage(i18n.alwaysAllow)}
+          </Button>
+        )}
+        <Button
+          className="rounded-full"
+          variant="outline"
+          disabled={pendingAction !== null}
+          onClick={() => handleAction('deny_once')}
+        >
+          {pendingAction === 'deny_once'
+            ? intl.formatMessage(i18n.approving)
+            : intl.formatMessage(i18n.deny)}
+        </Button>
+      </div>
+      {errorMessage && (
+        <p role="alert" className="mt-2 text-sm text-text-danger">
+          {errorMessage}
+        </p>
       )}
-      <Button className="rounded-full" variant="outline" onClick={() => handleAction('deny_once')}>
-        {intl.formatMessage(i18n.deny)}
-      </Button>
     </div>
   );
 }

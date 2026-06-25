@@ -3,8 +3,10 @@ pub mod apps;
 pub mod chatrecall;
 #[cfg(feature = "code-mode")]
 pub mod code_execution;
+pub mod context_core;
 pub mod developer;
 pub mod ext_manager;
+pub mod office;
 pub mod orchestrator;
 pub mod summarize;
 pub mod summon;
@@ -82,6 +84,33 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 unprefixed_tools: false,
                 hidden: false,
                 client_factory: |ctx| Box::new(chatrecall::ChatRecallClient::new(ctx).unwrap()),
+            },
+        );
+
+        map.insert(
+            context_core::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: context_core::EXTENSION_NAME,
+                display_name: "Context Core",
+                description: "Read and search compacted session-local tool output artifacts",
+                default_enabled: true,
+                unprefixed_tools: true,
+                hidden: false,
+                client_factory: |ctx| Box::new(context_core::ContextCoreClient::new(ctx).unwrap()),
+            },
+        );
+
+        map.insert(
+            office::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: office::EXTENSION_NAME,
+                display_name: "Office",
+                description:
+                    "Read/search/render PDFs and create/review/export presentation decks with layout guardrails",
+                default_enabled: true,
+                unprefixed_tools: true,
+                hidden: false,
+                client_factory: |ctx| Box::new(office::OfficeClient::new(ctx).unwrap()),
             },
         );
 

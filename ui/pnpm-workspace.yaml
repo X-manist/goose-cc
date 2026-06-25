@@ -3,3 +3,31 @@ packages:
   - 'text'
   - 'desktop'
   - 'goose-binary/*'
+
+nodeLinker: hoisted
+blockExoticSubdeps: false
+supportedArchitectures:
+  os:
+    - current
+  cpu:
+    - current
+  libc:
+    - current
+
+overrides:
+  react: ^19.2.4
+  react-dom: ^19.2.4
+
+onlyBuiltDependencies:
+  - '@electron/node-gyp'
+  - '@modelcontextprotocol/ext-apps'
+  - electron
+  - electron-winstaller
+  - esbuild
+
+allowBuilds:
+  '@electron/node-gyp': true
+  '@modelcontextprotocol/ext-apps': true
+  electron: true
+  electron-winstaller: true
+  esbuild: true

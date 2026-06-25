@@ -63,12 +63,16 @@ impl ProviderDef for ClaudeAcpProvider {
             let mode_mapping = HashMap::from([
                 // Closest to "autonomous": bypassPermissions skips confirmations.
                 (GooseMode::Auto, "bypassPermissions".to_string()),
+                (GooseMode::Yolo, "bypassPermissions".to_string()),
                 // Claude Code's default matches "ask before risky actions".
                 (GooseMode::Approve, "default".to_string()),
+                (GooseMode::Standard, "default".to_string()),
                 // acceptEdits auto-accepts file edits but still prompts for risky ops.
                 (GooseMode::SmartApprove, "acceptEdits".to_string()),
+                (GooseMode::Guarded, "acceptEdits".to_string()),
                 // Plan mode disables tool execution, aligning with chat-only intent.
                 (GooseMode::Chat, "plan".to_string()),
+                (GooseMode::Readonly, "plan".to_string()),
             ]);
 
             let provider_config = AcpProviderConfig {

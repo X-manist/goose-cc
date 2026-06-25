@@ -147,7 +147,7 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
             current_date_time: self.manager.current_date_timestamp.clone(),
             extension_tool_limits,
             goose_mode,
-            is_autonomous: goose_mode == GooseMode::Auto,
+            is_autonomous: goose_mode.is_autonomous(),
             enable_subagents: self.subagents_enabled,
             max_extensions: MAX_EXTENSIONS,
             max_tools: MAX_TOOLS,
@@ -171,7 +171,7 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
             system_prompt_extras.insert("hints".to_string(), hints);
         }
 
-        if goose_mode == GooseMode::Chat {
+        if goose_mode.is_chat_only() {
             system_prompt_extras.insert(
                 "chat_mode".to_string(),
                 "Right now you are in the chat only mode, no access to any tool use and system."

@@ -55,7 +55,7 @@ pub struct UpdateProviderRequest {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateSessionRequest {
     session_id: String,
-    goose_mode: Option<String>,
+    goose_mode: Option<GooseMode>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -544,17 +544,34 @@ async fn get_tools(
         .await
         .into_iter()
         .map(|tool| {
-            let permission = permission_manager
-                .get_user_permission(&tool.name)
-                .or_else(|| {
-                    if goose_mode == GooseMode::SmartApprove {
-                        permission_manager.get_smart_approve_permission(&tool.name)
-                    } else if goose_mode == GooseMode::Approve {
+            let effective_mode = goose_mode.effective_mode();
+            let is_readonly_tool = tool
+                .annotations
+                .as_ref()
+                .and_then(|anns| anns.read_only_hint)
+                == Some(true);
+            let permission = if effective_mode == GooseMode::Readonly {
+                match permission_manager.get_user_permission(&tool.name) {
+                    Some(PermissionLevel::NeverAllow) => Some(PermissionLevel::NeverAllow),
+                    Some(PermissionLevel::AskBefore) if is_readonly_tool => {
                         Some(PermissionLevel::AskBefore)
-                    } else {
-                        None
                     }
-                });
+                    _ if is_readonly_tool => Some(PermissionLevel::AlwaysAllow),
+                    _ => Some(PermissionLevel::NeverAllow),
+                }
+            } else {
+                permission_manager
+                    .get_user_permission(&tool.name)
+                    .or_else(|| {
+                        if effective_mode == GooseMode::SmartApprove {
+                            permission_manager.get_smart_approve_permission(&tool.name)
+                        } else if effective_mode == GooseMode::Approve {
+                            Some(PermissionLevel::AskBefore)
+                        } else {
+                            None
+                        }
+                    })
+            };
 
             ToolInfo::new(
                 &tool.name,
@@ -679,14 +696,7 @@ async fn update_session(
         .await
         .map_err(|e| (e, "No agent for session id".to_owned()))?;
 
-    if let Some(mode_str) = payload.goose_mode {
-        let mode: GooseMode = mode_str.parse().map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid mode: {}", mode_str),
-            )
-        })?;
-
+    if let Some(mode) = payload.goose_mode {
         agent
             .update_goose_mode(mode, &payload.session_id)
             .await

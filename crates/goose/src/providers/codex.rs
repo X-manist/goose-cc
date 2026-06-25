@@ -102,7 +102,7 @@ impl CodexProvider {
         cmd: &mut Command,
         goose_mode: GooseMode,
     ) -> Result<(), ProviderError> {
-        match goose_mode {
+        match goose_mode.effective_mode() {
             GooseMode::Auto => {
                 // --yolo is shorthand for --dangerously-bypass-approvals-and-sandbox
                 cmd.arg("--yolo");
@@ -115,9 +115,12 @@ impl CodexProvider {
                 // Default codex behavior - interactive approvals
                 // No special flags needed
             }
-            GooseMode::Chat => {
+            GooseMode::Chat | GooseMode::Readonly => {
                 // Read-only sandbox mode
                 cmd.arg("--sandbox").arg("read-only");
+            }
+            GooseMode::Guarded | GooseMode::Standard | GooseMode::Yolo => {
+                unreachable!("codex permission flags should match on effective goose mode")
             }
         }
         Ok(())
@@ -1315,6 +1318,10 @@ mod tests {
     #[test_case(GooseMode::SmartApprove, &["--full-auto"] ; "smart_approve_full_auto")]
     #[test_case(GooseMode::Approve, &[] as &[&str] ; "approve_no_flags")]
     #[test_case(GooseMode::Chat, &["--sandbox", "read-only"] ; "chat_read_only")]
+    #[test_case(GooseMode::Readonly, &["--sandbox", "read-only"] ; "readonly_read_only")]
+    #[test_case(GooseMode::Guarded, &["--full-auto"] ; "guarded_full_auto")]
+    #[test_case(GooseMode::Standard, &[] as &[&str] ; "standard_no_flags")]
+    #[test_case(GooseMode::Yolo, &["--yolo"] ; "yolo")]
     fn test_apply_permission_flags(mode: GooseMode, expected: &[&str]) {
         let mut cmd = tokio::process::Command::new("codex");
         CodexProvider::apply_permission_flags(&mut cmd, mode).unwrap();

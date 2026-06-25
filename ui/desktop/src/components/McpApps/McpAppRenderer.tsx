@@ -20,7 +20,6 @@ import type {
   McpUiDisplayMode,
   McpUiHostContext,
   McpUiResourceCsp,
-  McpUiResourcePermissions,
   McpUiSizeChangedNotification,
 } from '@modelcontextprotocol/ext-apps/app-bridge';
 import type { CallToolResult, JSONRPCRequest, Tool } from '@modelcontextprotocol/sdk/types.js';
@@ -123,6 +122,18 @@ const i18n = defineMessages({
   },
 });
 
+type McpUiResourceCspCompat = McpUiResourceCsp & {
+  frameDomains?: string[];
+  baseUriDomains?: string[];
+};
+
+type McpUiResourcePermissionsCompat = {
+  camera?: Record<string, never>;
+  microphone?: Record<string, never>;
+  geolocation?: Record<string, never>;
+  clipboardWrite?: Record<string, never>;
+};
+
 const DEFAULT_IFRAME_HEIGHT = 200;
 const FULLSCREEN_HEADER_HEIGHT = 48;
 
@@ -173,7 +184,7 @@ function getContainerDimensions(
   return { ...widthDimension, ...heightDimension };
 }
 
-async function fetchMcpAppProxyUrl(csp: McpUiResourceCsp | null): Promise<string | null> {
+async function fetchMcpAppProxyUrl(csp: McpUiResourceCspCompat | null): Promise<string | null> {
   try {
     const baseUrl = await window.electron.getGoosedHostPort();
     const secretKey = await window.electron.getSecretKey();
@@ -222,7 +233,7 @@ interface McpAppRendererProps {
 }
 
 interface ResourceMeta {
-  csp: McpUiResourceCsp | null;
+  csp: McpUiResourceCspCompat | null;
   permissions: SandboxPermissions | null;
   prefersBorder: boolean;
 }
@@ -241,7 +252,7 @@ type AppState =
       html: string;
       meta: ResourceMeta;
       sandboxUrl: URL;
-      sandboxCsp: McpUiResourceCsp | null;
+      sandboxCsp: McpUiResourceCspCompat | null;
     }
   | { status: 'error'; message: string; html: string | null; meta: ResourceMeta };
 
@@ -249,7 +260,7 @@ type AppAction =
   | { type: 'FETCH_RESOURCE' }
   | { type: 'RESOURCE_LOADED'; html: string | null; meta: ResourceMeta }
   | { type: 'RESOURCE_FAILED'; message: string }
-  | { type: 'SANDBOX_READY'; sandboxUrl: string; sandboxCsp: McpUiResourceCsp | null }
+  | { type: 'SANDBOX_READY'; sandboxUrl: string; sandboxCsp: McpUiResourceCspCompat | null }
   | { type: 'SANDBOX_FAILED'; message: string }
   | { type: 'ERROR'; message: string };
 
@@ -383,7 +394,7 @@ export default function McpAppRenderer({
   // which prevents the iframe from being torn down and recreated (visible flicker).
   // Declared before useReducer so the lazy initializer can read them.
   const fetchedDataRef = useRef<{ html: string; meta: ResourceMeta } | null>(null);
-  const sandboxUrlRef = useRef<{ url: string; csp: McpUiResourceCsp | null } | null>(null);
+  const sandboxUrlRef = useRef<{ url: string; csp: McpUiResourceCspCompat | null } | null>(null);
 
   const [state, dispatch] = useReducer(appReducer, undefined, (): AppState => {
     // On StrictMode remount, skip straight to ready if we have all cached data.
@@ -468,8 +479,8 @@ export default function McpAppRenderer({
             const rawMeta = content._meta as
               | {
                   ui?: {
-                    csp?: McpUiResourceCsp;
-                    permissions?: McpUiResourcePermissions;
+                    csp?: McpUiResourceCspCompat;
+                    permissions?: McpUiResourcePermissionsCompat;
                     prefersBorder?: boolean;
                   };
                 }
@@ -747,12 +758,13 @@ export default function McpAppRenderer({
   const readyCsp = state.status === 'ready' ? state.sandboxCsp : null;
   const mcpUiCsp = useMemo((): McpUiResourceCsp | undefined => {
     if (!readyCsp) return undefined;
-    return {
+    const csp: McpUiResourceCspCompat = {
       connectDomains: readyCsp.connectDomains ?? undefined,
       resourceDomains: readyCsp.resourceDomains ?? undefined,
-      frameDomains: readyCsp.frameDomains ?? undefined,
-      baseUriDomains: readyCsp.baseUriDomains ?? undefined,
     };
+    csp.frameDomains = readyCsp.frameDomains ?? undefined;
+    csp.baseUriDomains = readyCsp.baseUriDomains ?? undefined;
+    return csp;
   }, [readyCsp]);
 
   const readySandboxUrl = state.status === 'ready' ? state.sandboxUrl : null;

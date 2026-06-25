@@ -1,10 +1,12 @@
 use super::completion::GooseCompleter;
 use super::{CompletionCache, HintStatus};
+use crate::commands::review::ReviewOptions;
 use anyhow::Result;
 use goose::config::{Config, GooseMode};
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use strum::VariantNames;
 
@@ -26,6 +28,13 @@ pub enum InputResult {
     Clear,
     Recipe(Option<String>),
     Compact,
+    Status,
+    Cost,
+    Debug(Option<bool>),
+    Doctor,
+    Review(ReviewOptions),
+    Resume(ResumeCommandOptions),
+    Worktree(WorktreeCommandOptions),
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -42,6 +51,25 @@ pub struct PromptCommandOptions {
 #[derive(Debug)]
 pub struct PlanCommandOptions {
     pub message_text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeCommandOptions {
+    pub target: Option<String>,
+    pub history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeCommand {
+    Status,
+    Start,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeCommandOptions {
+    pub command: WorktreeCommand,
+    pub label: Option<String>,
+    pub base_ref: Option<String>,
 }
 
 struct CtrlCHandler {
@@ -200,11 +228,23 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODEL: &str = "/model";
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
     const CMD_PLAN: &str = "/plan";
+    const CMD_PLAN_WITH_SPACE: &str = "/plan ";
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_CLEAR: &str = "/clear";
     const CMD_RECIPE: &str = "/recipe";
     const CMD_COMPACT: &str = "/compact";
     const CMD_SUMMARIZE_DEPRECATED: &str = "/summarize";
+    const CMD_STATUS: &str = "/status";
+    const CMD_COST: &str = "/cost";
+    const CMD_DEBUG: &str = "/debug";
+    const CMD_DEBUG_WITH_SPACE: &str = "/debug ";
+    const CMD_DOCTOR: &str = "/doctor";
+    const CMD_REVIEW: &str = "/review";
+    const CMD_REVIEW_WITH_SPACE: &str = "/review ";
+    const CMD_RESUME: &str = "/resume";
+    const CMD_RESUME_WITH_SPACE: &str = "/resume ";
+    const CMD_WORKTREE: &str = "/worktree";
+    const CMD_WORKTREE_WITH_SPACE: &str = "/worktree ";
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
@@ -277,13 +317,41 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 Some(InputResult::Model(Some(model)))
             }
         }
-        s if s.starts_with(CMD_PLAN) => {
+        s if s == CMD_PLAN || s.starts_with(CMD_PLAN_WITH_SPACE) => {
             parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
         }
         s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s.starts_with(CMD_RECIPE) => parse_recipe_command(s),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
+        s if s == CMD_STATUS => Some(InputResult::Status),
+        s if s == CMD_COST => Some(InputResult::Cost),
+        s if s == CMD_DOCTOR => Some(InputResult::Doctor),
+        s if s == CMD_DEBUG => Some(InputResult::Debug(None)),
+        s if s.starts_with(CMD_DEBUG_WITH_SPACE) => {
+            let value = s
+                .strip_prefix(CMD_DEBUG_WITH_SPACE)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            match value.as_str() {
+                "on" | "true" | "1" => Some(InputResult::Debug(Some(true))),
+                "off" | "false" | "0" => Some(InputResult::Debug(Some(false))),
+                _ => {
+                    println!("{}", console::style("Usage: /debug [on|off]").red());
+                    Some(InputResult::Retry)
+                }
+            }
+        }
+        s if s == CMD_REVIEW || s.starts_with(CMD_REVIEW_WITH_SPACE) => {
+            parse_review_command(s.get(CMD_REVIEW.len()..).unwrap_or("").trim())
+        }
+        s if s == CMD_RESUME || s.starts_with(CMD_RESUME_WITH_SPACE) => {
+            parse_resume_command(s.get(CMD_RESUME.len()..).unwrap_or("").trim())
+        }
+        s if s == CMD_WORKTREE || s.starts_with(CMD_WORKTREE_WITH_SPACE) => {
+            parse_worktree_command(s.get(CMD_WORKTREE.len()..).unwrap_or("").trim())
+        }
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -401,6 +469,302 @@ fn parse_plan_command(input: String) -> Option<InputResult> {
     Some(InputResult::Plan(options))
 }
 
+fn parse_review_command(args: &str) -> Option<InputResult> {
+    let parts = match shlex::split(args) {
+        Some(parts) => parts,
+        None => {
+            println!("{}", console::style("Invalid /review arguments").red());
+            return Some(InputResult::Retry);
+        }
+    };
+
+    let mut opts = ReviewOptions {
+        severity: "medium".to_string(),
+        ..ReviewOptions::default()
+    };
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i].as_str() {
+            "--dry-run" => opts.dry_run = true,
+            "--summary-only" => opts.summary_only = true,
+            "--quiet" | "-q" => opts.quiet = true,
+            "--no-orchestrate" => opts.no_orchestrate = true,
+            "--checks-only" => opts.checks_only = true,
+            "--prompt" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!("{}", console::style("Usage: /review --prompt <file>").red());
+                    return Some(InputResult::Retry);
+                }
+                opts.prompt_file = Some(PathBuf::from(&parts[i]));
+            }
+            "--model" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!("{}", console::style("Usage: /review --model <model>").red());
+                    return Some(InputResult::Retry);
+                }
+                opts.default_model = Some(parts[i].clone());
+            }
+            "--provider" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --provider <provider>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.provider = Some(parts[i].clone());
+            }
+            "--override-model" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --override-model <model>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.override_model = Some(parts[i].clone());
+            }
+            "--turn-limit" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --turn-limit <n>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                match parts[i].parse::<usize>() {
+                    Ok(n) => opts.default_turn_limit = Some(n),
+                    Err(_) => {
+                        println!("{}", console::style("--turn-limit must be a number").red());
+                        return Some(InputResult::Retry);
+                    }
+                }
+            }
+            "--instructions" | "-i" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --instructions <text>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.instructions = Some(parts[i].clone());
+            }
+            "--files" | "-f" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --files <file...>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                let start_len = opts.files.len();
+                while i < parts.len() && !parts[i].starts_with('-') {
+                    opts.files.push(parts[i].clone());
+                    i += 1;
+                }
+                if opts.files.len() == start_len {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --files <file...>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                i = i.saturating_sub(1);
+            }
+            "--check-filter" | "-c" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --check-filter <name...>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                let start_len = opts.check_filter.len();
+                while i < parts.len() && !parts[i].starts_with('-') {
+                    opts.check_filter.push(parts[i].clone());
+                    i += 1;
+                }
+                if opts.check_filter.len() == start_len {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --check-filter <name...>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                i = i.saturating_sub(1);
+            }
+            "--check-scope" | "-s" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --check-scope <dir>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.check_scope = Some(PathBuf::from(&parts[i]));
+            }
+            "--severity" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /review --severity <level>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.severity = parts[i].clone();
+            }
+            arg if arg.starts_with('-') => {
+                println!(
+                    "{}",
+                    console::style(format!("Unknown /review option: {arg}")).red()
+                );
+                return Some(InputResult::Retry);
+            }
+            range => {
+                if opts.range.is_some() {
+                    println!(
+                        "{}",
+                        console::style("/review accepts at most one range").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                opts.range = Some(range.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    Some(InputResult::Review(opts))
+}
+
+fn parse_resume_command(args: &str) -> Option<InputResult> {
+    let parts = match shlex::split(args) {
+        Some(parts) => parts,
+        None => {
+            println!("{}", console::style("Invalid /resume arguments").red());
+            return Some(InputResult::Retry);
+        }
+    };
+    let mut options = ResumeCommandOptions::default();
+    for part in parts {
+        match part.as_str() {
+            "--history" => options.history = true,
+            arg if arg.starts_with('-') => {
+                println!(
+                    "{}",
+                    console::style(format!("Unknown /resume option: {arg}")).red()
+                );
+                return Some(InputResult::Retry);
+            }
+            target => {
+                if options.target.is_some() {
+                    println!(
+                        "{}",
+                        console::style("/resume accepts one session id or name").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                options.target = Some(target.to_string());
+            }
+        }
+    }
+    Some(InputResult::Resume(options))
+}
+
+fn parse_worktree_command(args: &str) -> Option<InputResult> {
+    let parts = match shlex::split(args) {
+        Some(parts) => parts,
+        None => {
+            println!("{}", console::style("Invalid /worktree arguments").red());
+            return Some(InputResult::Retry);
+        }
+    };
+    if parts.is_empty() {
+        return Some(InputResult::Worktree(WorktreeCommandOptions {
+            command: WorktreeCommand::Status,
+            label: None,
+            base_ref: None,
+        }));
+    }
+
+    let command = match parts[0].as_str() {
+        "status" => WorktreeCommand::Status,
+        "start" | "create" => WorktreeCommand::Start,
+        other => {
+            println!(
+                "{}",
+                console::style(format!("Unknown /worktree command: {other}")).red()
+            );
+            return Some(InputResult::Retry);
+        }
+    };
+
+    let mut options = WorktreeCommandOptions {
+        command,
+        label: None,
+        base_ref: None,
+    };
+    if options.command == WorktreeCommand::Status && parts.len() > 1 {
+        println!("{}", console::style("Usage: /worktree status").red());
+        return Some(InputResult::Retry);
+    }
+    let mut i = 1;
+    while i < parts.len() {
+        match parts[i].as_str() {
+            "--label" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /worktree start --label <name>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                options.label = Some(parts[i].clone());
+            }
+            "--base" => {
+                i += 1;
+                if i >= parts.len() {
+                    println!(
+                        "{}",
+                        console::style("Usage: /worktree start --base <ref>").red()
+                    );
+                    return Some(InputResult::Retry);
+                }
+                options.base_ref = Some(parts[i].clone());
+            }
+            arg if arg.starts_with('-') => {
+                println!(
+                    "{}",
+                    console::style(format!("Unknown /worktree option: {arg}")).red()
+                );
+                return Some(InputResult::Retry);
+            }
+            label => {
+                if options.label.is_some() {
+                    println!("{}", console::style("/worktree accepts one label").red());
+                    return Some(InputResult::Retry);
+                }
+                options.label = Some(label.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    Some(InputResult::Worktree(options))
+}
+
 fn print_help() {
     let newline_key = get_newline_key().to_ascii_uppercase();
     let modes = GooseMode::VARIANTS.join(", ");
@@ -425,6 +789,13 @@ fn print_help() {
 /recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
                        If no filepath is provided, it will be saved to ./recipe.yaml.
 /compact - Compact the current conversation to reduce context length while preserving key information.
+/doctor - Check that your Goose setup is working.
+/status - Show session, model, mode, token, and context usage details.
+/cost - Show estimated cost for the current session when model pricing is available.
+/debug [on|off] - Show or toggle debug rendering for this session.
+/review [options] [range] - Review the current diff from this session.
+/resume [session-id-or-name] [--history] - Resume the latest or named session in this terminal.
+/worktree [status|start] [label] [--base <ref>] - Inspect or create an isolated git worktree for this session.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
@@ -501,6 +872,31 @@ mod tests {
             Some(InputResult::ToggleFullToolOutput)
         ));
 
+        assert!(matches!(
+            handle_slash_command("/status"),
+            Some(InputResult::Status)
+        ));
+        assert!(matches!(
+            handle_slash_command("/cost"),
+            Some(InputResult::Cost)
+        ));
+        assert!(matches!(
+            handle_slash_command("/debug"),
+            Some(InputResult::Debug(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/debug on"),
+            Some(InputResult::Debug(Some(true)))
+        ));
+        assert!(matches!(
+            handle_slash_command("/debug off"),
+            Some(InputResult::Debug(Some(false)))
+        ));
+        assert!(matches!(
+            handle_slash_command("/doctor"),
+            Some(InputResult::Doctor)
+        ));
+
         // Test extension command
         if let Some(InputResult::AddExtension(cmd)) = handle_slash_command("/extension foo bar") {
             assert_eq!(cmd, "foo bar");
@@ -532,6 +928,119 @@ mod tests {
 
         // Test unknown commands
         assert!(handle_slash_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn test_review_command() {
+        let Some(InputResult::Review(opts)) = handle_slash_command("/review") else {
+            panic!("Expected Review");
+        };
+        assert_eq!(opts.severity, "medium");
+        assert!(opts.range.is_none());
+        assert!(!opts.summary_only);
+
+        let Some(InputResult::Review(opts)) = handle_slash_command(
+            r#"/review --summary-only --dry-run --files crates/goose/src/lib.rs README.md --check-filter rust ui --check-scope .agents --severity high --turn-limit 3 --instructions "focus on regressions" main...HEAD"#,
+        ) else {
+            panic!("Expected Review with options");
+        };
+        assert!(opts.summary_only);
+        assert!(opts.dry_run);
+        assert_eq!(opts.files, vec!["crates/goose/src/lib.rs", "README.md"]);
+        assert_eq!(opts.check_filter, vec!["rust", "ui"]);
+        assert_eq!(opts.check_scope, Some(PathBuf::from(".agents")));
+        assert_eq!(opts.severity, "high");
+        assert_eq!(opts.default_turn_limit, Some(3));
+        assert_eq!(opts.instructions.as_deref(), Some("focus on regressions"));
+        assert_eq!(opts.range.as_deref(), Some("main...HEAD"));
+
+        assert!(matches!(
+            handle_slash_command("/review --unknown"),
+            Some(InputResult::Retry)
+        ));
+        assert!(matches!(
+            handle_slash_command("/review --files --summary-only"),
+            Some(InputResult::Retry)
+        ));
+        assert!(matches!(
+            handle_slash_command("/review --check-filter --severity high"),
+            Some(InputResult::Retry)
+        ));
+        assert!(handle_slash_command("/reviewx").is_none());
+    }
+
+    #[test]
+    fn test_resume_command() {
+        assert!(matches!(
+            handle_slash_command("/resume"),
+            Some(InputResult::Resume(ResumeCommandOptions {
+                target: None,
+                history: false
+            }))
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/resume session-123 --history"),
+            Some(InputResult::Resume(ResumeCommandOptions {
+                target: Some(ref target),
+                history: true
+            })) if target == "session-123"
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/resume one two"),
+            Some(InputResult::Retry)
+        ));
+        assert!(handle_slash_command("/resumex").is_none());
+    }
+
+    #[test]
+    fn test_worktree_command() {
+        assert!(matches!(
+            handle_slash_command("/worktree"),
+            Some(InputResult::Worktree(WorktreeCommandOptions {
+                command: WorktreeCommand::Status,
+                label: None,
+                base_ref: None
+            }))
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/worktree status"),
+            Some(InputResult::Worktree(WorktreeCommandOptions {
+                command: WorktreeCommand::Status,
+                label: None,
+                base_ref: None
+            }))
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/worktree start long-task --base main"),
+            Some(InputResult::Worktree(WorktreeCommandOptions {
+                command: WorktreeCommand::Start,
+                label: Some(ref label),
+                base_ref: Some(ref base)
+            })) if label == "long-task" && base == "main"
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/worktree create --label review-pass"),
+            Some(InputResult::Worktree(WorktreeCommandOptions {
+                command: WorktreeCommand::Start,
+                label: Some(ref label),
+                base_ref: None
+            })) if label == "review-pass"
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/worktree status extra"),
+            Some(InputResult::Retry)
+        ));
+        assert!(matches!(
+            handle_slash_command("/worktree start one two"),
+            Some(InputResult::Retry)
+        ));
+        assert!(handle_slash_command("/worktreex").is_none());
     }
 
     #[test]
@@ -684,6 +1193,9 @@ mod tests {
             }
             _ => panic!("Expected Plan"),
         }
+
+        assert!(handle_slash_command("/planet").is_none());
+        assert!(handle_slash_command("/planfoo").is_none());
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub static EXTENSION_NAME: &str = "summon";
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
 const TASK_LABEL_BUDGET: usize = 60;
+const NOTIFICATION_SUBSCRIBER_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn kind_plural(kind: SourceType) -> &'static str {
     match kind {
@@ -58,6 +59,7 @@ pub struct DelegateParams {
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_turns: Option<usize>,
+    pub permission_profile: Option<GooseMode>,
     #[serde(default)]
     pub r#async: bool,
 }
@@ -81,6 +83,12 @@ pub struct CompletedTask {
     pub duration: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct BuiltDelegateRecipe {
+    recipe: Recipe,
+    source_permission_profile: Option<GooseMode>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentMetadata {
     name: String,
@@ -88,6 +96,8 @@ struct AgentMetadata {
     description: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    permission_profile: Option<GooseMode>,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -114,6 +124,14 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
         format!("Agent{}", model_info)
     });
 
+    let mut properties = std::collections::HashMap::new();
+    if let Some(permission_profile) = metadata.permission_profile {
+        properties.insert(
+            "permission_profile".to_string(),
+            serde_json::Value::String(permission_profile.to_string()),
+        );
+    }
+
     Some(SourceEntry {
         source_type: SourceType::Agent,
         name: metadata.name,
@@ -123,7 +141,7 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
         global: false,
         writable: true,
         supporting_files: Vec::new(),
-        properties: std::collections::HashMap::new(),
+        properties,
     })
 }
 
@@ -442,21 +460,49 @@ impl SummonClient {
     }
 
     fn spawn_notification_bridge(
-        mut notif_rx: tokio::sync::mpsc::UnboundedReceiver<ServerNotification>,
+        notif_rx: tokio::sync::mpsc::UnboundedReceiver<ServerNotification>,
         subscribers: Arc<Mutex<Vec<mpsc::Sender<ServerNotification>>>>,
         buffer: Arc<Mutex<Vec<ServerNotification>>>,
     ) {
+        Self::spawn_notification_bridge_with_timeout(
+            notif_rx,
+            subscribers,
+            buffer,
+            NOTIFICATION_SUBSCRIBER_SEND_TIMEOUT,
+        );
+    }
+
+    fn spawn_notification_bridge_with_timeout(
+        mut notif_rx: tokio::sync::mpsc::UnboundedReceiver<ServerNotification>,
+        subscribers: Arc<Mutex<Vec<mpsc::Sender<ServerNotification>>>>,
+        buffer: Arc<Mutex<Vec<ServerNotification>>>,
+        send_timeout: Duration,
+    ) {
         tokio::spawn(async move {
             while let Some(notification) = notif_rx.recv().await {
-                let mut subs = subscribers.lock().await;
-                if subs.is_empty() {
-                    drop(subs);
+                let targets = subscribers.lock().await.clone();
+                if targets.is_empty() {
                     buffer.lock().await.push(notification);
                 } else {
-                    subs.retain(|tx| match tx.try_send(notification.clone()) {
-                        Ok(()) => true,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    let mut alive = Vec::with_capacity(targets.len());
+                    for tx in &targets {
+                        match tokio::time::timeout(send_timeout, tx.send(notification.clone()))
+                            .await
+                        {
+                            Ok(Ok(())) => alive.push(tx.clone()),
+                            Ok(Err(_)) => {}
+                            Err(_) => {
+                                warn!("Dropping slow subagent notification subscriber");
+                            }
+                        }
+                    }
+                    let mut subs = subscribers.lock().await;
+                    subs.retain(|tx| {
+                        if tx.is_closed() {
+                            return false;
+                        }
+                        let was_target = targets.iter().any(|target| target.same_channel(tx));
+                        !was_target || alive.iter().any(|alive_tx| alive_tx.same_channel(tx))
                     });
                 }
             }
@@ -534,6 +580,12 @@ impl SummonClient {
                     "minimum": 1,
                     "description": "Maximum turns for this delegate. Overrides recipe settings.max_turns and GOOSE_SUBAGENT_MAX_TURNS."
                 },
+                "permission_profile": {
+                    "type": "string",
+                    "enum": ["readonly", "guarded", "standard", "yolo"],
+                    "default": "readonly",
+                    "description": "Permission profile for the subagent. Defaults to readonly to avoid concurrent writes. Sync delegates can request parent-session approvals in guarded/standard; async delegates must use readonly or yolo."
+                },
                 "async": {
                     "type": "boolean",
                     "default": false,
@@ -555,6 +607,9 @@ impl SummonClient {
              - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
              Research (read-only): parallelize freely - delegates explore and report back.\n\
              Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
+             Permission priority: explicit permission_profile > agent frontmatter permission_profile > readonly default.\n\
+             Sync delegates can use guarded/standard and route approval prompts through the parent session.\n\
+             Async delegates cannot use approval-based profiles because no active user prompt is available.\n\n\
              Decompose → async delegates → load(taskId) for each → synthesize."
                 .to_string(),
             schema.as_object().unwrap().clone(),
@@ -1036,6 +1091,7 @@ impl SummonClient {
     async fn handle_delegate(
         &self,
         session_id: &str,
+        parent_tool_request_id: Option<String>,
         arguments: Option<JsonObject>,
         cancellation_token: CancellationToken,
     ) -> Result<CallToolResult, String> {
@@ -1061,7 +1117,9 @@ impl SummonClient {
         }
 
         if params.r#async {
-            let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
+            let (content, task_id) = self
+                .handle_async_delegate(session_id, parent_tool_request_id, params)
+                .await?;
             let mut meta = Meta::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -1071,23 +1129,27 @@ impl SummonClient {
         }
 
         let working_dir = session.working_dir.clone();
-        let recipe = self
+        let built_recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
+        let recipe = built_recipe.recipe;
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(
+                &params,
+                &recipe,
+                &session,
+                built_recipe.source_permission_profile,
+            )
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // Subagents default to readonly to avoid concurrent writes.
         let agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            task_config.goose_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         );
@@ -1099,7 +1161,7 @@ impl SummonClient {
                 working_dir,
                 "Delegated task".to_string(),
                 SessionType::SubAgent,
-                GooseMode::Auto,
+                task_config.goose_mode,
             )
             .await
             .map_err(|e| format!("Failed to create subagent session: {}", e))?;
@@ -1118,10 +1180,13 @@ impl SummonClient {
             recipe,
             task_config,
             return_last_only: true,
+            parent_session_id: session_id.to_string(),
+            parent_tool_request_id,
             session_id: subagent_session.id,
             cancellation_token: Some(cancellation_token),
             on_message: None,
             notification_tx: Some(notif_tx),
+            approval_forwarding: true,
         })
         .await;
 
@@ -1166,12 +1231,15 @@ impl SummonClient {
         params: &DelegateParams,
         session_id: &str,
         working_dir: &Path,
-    ) -> Result<Recipe, String> {
+    ) -> Result<BuiltDelegateRecipe, String> {
         if let Some(source_name) = &params.source {
             self.build_source_recipe(source_name, params, session_id, working_dir)
                 .await
         } else {
-            self.build_adhoc_recipe(params)
+            Ok(BuiltDelegateRecipe {
+                recipe: self.build_adhoc_recipe(params)?,
+                source_permission_profile: None,
+            })
         }
     }
 
@@ -1196,17 +1264,18 @@ impl SummonClient {
         params: &DelegateParams,
         session_id: &str,
         working_dir: &Path,
-    ) -> Result<Recipe, String> {
+    ) -> Result<BuiltDelegateRecipe, String> {
         let source = self
             .resolve_source(session_id, source_name, working_dir)
             .await?
             .ok_or_else(|| format!("Source '{}' not found", source_name))?;
 
-        let mut recipe = match source.source_type {
-            SourceType::Recipe | SourceType::Subrecipe => {
+        let (mut recipe, source_permission_profile) = match source.source_type {
+            SourceType::Recipe | SourceType::Subrecipe => (
                 self.build_recipe_from_source(&source, params, session_id)
-                    .await?
-            }
+                    .await?,
+                None,
+            ),
             SourceType::Agent => self.build_recipe_from_agent(&source, params)?,
             _ => {
                 return Err(format!(
@@ -1225,7 +1294,10 @@ impl SummonClient {
             }
         }
 
-        Ok(recipe)
+        Ok(BuiltDelegateRecipe {
+            recipe,
+            source_permission_profile,
+        })
     }
 
     async fn build_recipe_from_source(
@@ -1310,7 +1382,7 @@ impl SummonClient {
         &self,
         source: &SourceEntry,
         params: &DelegateParams,
-    ) -> Result<Recipe, String> {
+    ) -> Result<(Recipe, Option<GooseMode>), String> {
         let agent_content = if source.path.is_empty() {
             return Err("Agent source has no path".to_string());
         } else {
@@ -1323,12 +1395,13 @@ impl SummonClient {
             .ok_or("No frontmatter found in agent file")?;
 
         let model = metadata.model;
+        let permission_profile = metadata.permission_profile;
 
         // max_turns is set later in build_task_config so it can incorporate params.max_turns
         // with the correct priority ordering; setting it here would cause it to be overridden
         // by the parent session's recipe instead.
-        let settings = model.map(|m| Settings {
-            goose_model: Some(m),
+        let settings = model.map(|model| Settings {
+            goose_model: Some(model),
             goose_provider: params.provider.clone(),
             temperature: params.temperature,
             max_turns: None,
@@ -1348,9 +1421,30 @@ impl SummonClient {
             builder = builder.prompt("Proceed with your expertise to produce a useful result.");
         }
 
-        builder
+        let recipe = builder
             .build()
-            .map_err(|e| format!("Failed to build recipe from agent: {}", e))
+            .map_err(|e| format!("Failed to build recipe from agent: {}", e))?;
+        Ok((recipe, permission_profile))
+    }
+
+    fn resolve_permission_profile(
+        params: &DelegateParams,
+        source_permission_profile: Option<GooseMode>,
+    ) -> Result<GooseMode, String> {
+        let goose_mode = params
+            .permission_profile
+            .or(source_permission_profile)
+            .unwrap_or(GooseMode::Readonly);
+        if matches!(
+            goose_mode,
+            GooseMode::Auto | GooseMode::Approve | GooseMode::SmartApprove | GooseMode::Chat
+        ) {
+            return Err(format!(
+                "Subagent permission profile '{}' is not supported for delegated subagents. Use readonly for review/explore tasks, guarded or standard for parent-approved write tasks, or yolo only inside an isolated worktree. Legacy auto/approve/smart_approve aliases and chat mode are rejected so subagent write access is explicit.",
+                goose_mode
+            ));
+        }
+        Ok(goose_mode)
     }
 
     async fn build_task_config(
@@ -1358,7 +1452,10 @@ impl SummonClient {
         params: &DelegateParams,
         recipe: &Recipe,
         session: &crate::session::Session,
+        source_permission_profile: Option<GooseMode>,
     ) -> Result<TaskConfig, anyhow::Error> {
+        let goose_mode = Self::resolve_permission_profile(params, source_permission_profile)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let provider = self.resolve_provider(params, recipe, session).await?;
 
         let mut extensions = EnabledExtensionsState::extensions_or_default(
@@ -1388,7 +1485,8 @@ impl SummonClient {
         }
 
         let task_config = TaskConfig::new(provider, &session.id, &session.working_dir, extensions)
-            .with_max_turns(Some(max_turns));
+            .with_max_turns(Some(max_turns))
+            .with_goose_mode(goose_mode);
 
         Ok(task_config)
     }
@@ -1553,6 +1651,7 @@ impl SummonClient {
     async fn handle_async_delegate(
         &self,
         session_id: &str,
+        parent_tool_request_id: Option<String>,
         params: DelegateParams,
     ) -> Result<(Vec<Content>, String), String> {
         let task_count = self.background_tasks.lock().await.len();
@@ -1572,25 +1671,39 @@ impl SummonClient {
             .map_err(|e| format!("Failed to get session: {}", e))?;
 
         let working_dir = session.working_dir.clone();
-        let recipe = self
+        let built_recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
+        let recipe = built_recipe.recipe;
+
+        let goose_mode =
+            Self::resolve_permission_profile(&params, built_recipe.source_permission_profile)
+                .map_err(|e| format!("Failed to resolve permission profile: {}", e))?;
+        if goose_mode.is_approval_required() {
+            return Err(format!(
+                "Async delegated tasks cannot use approval-based permission profile '{}'. Use sync delegate for parent-session approvals, or choose readonly/yolo for background work.",
+                goose_mode
+            ));
+        }
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(
+                &params,
+                &recipe,
+                &session,
+                built_recipe.source_permission_profile,
+            )
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
         let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // Subagents default to readonly to avoid concurrent writes.
         let agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            task_config.goose_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         );
@@ -1602,7 +1715,7 @@ impl SummonClient {
                 working_dir,
                 description.clone(),
                 SessionType::SubAgent,
-                GooseMode::Auto,
+                task_config.goose_mode,
             )
             .await
             .map_err(|e| format!("Failed to create subagent session: {}", e))?;
@@ -1632,16 +1745,20 @@ impl SummonClient {
             Arc::clone(&notification_buffer),
         );
 
+        let parent_session_id = session_id.to_string();
         let handle = tokio::spawn(async move {
             run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe,
                 task_config,
                 return_last_only: true,
+                parent_session_id,
+                parent_tool_request_id,
                 session_id: subagent_session.id,
                 cancellation_token: Some(task_token_clone),
                 on_message: Some(on_message),
                 notification_tx: Some(notif_tx),
+                approval_forwarding: false,
             })
             .await
         });
@@ -1720,7 +1837,12 @@ impl McpClientTrait for SummonClient {
             },
             "delegate" => {
                 match self
-                    .handle_delegate(session_id, arguments, cancellation_token)
+                    .handle_delegate(
+                        session_id,
+                        ctx.tool_call_request_id.clone(),
+                        arguments,
+                        cancellation_token,
+                    )
                     .await
                 {
                     Ok(result) => Ok(result),
@@ -1820,6 +1942,7 @@ impl McpClientTrait for SummonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelConfig;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -1827,9 +1950,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_context() -> PlatformExtensionContext {
+        let data_dir = tempfile::tempdir().unwrap().keep();
         PlatformExtensionContext {
             extension_manager: None,
-            session_manager: Arc::new(crate::session::SessionManager::instance()),
+            session_manager: Arc::new(crate::session::SessionManager::new(data_dir)),
             session: None,
             use_login_shell_path: false,
         }
@@ -1840,11 +1964,19 @@ mod tests {
         let agent = r#"---
 name: reviewer
 model: sonnet
+permission_profile: yolo
 ---
 You review code."#;
         let source = parse_agent_content(agent, Path::new("")).unwrap();
         assert_eq!(source.name, "reviewer");
         assert!(source.description.contains("sonnet"));
+        assert_eq!(
+            source
+                .properties
+                .get("permission_profile")
+                .and_then(|v| v.as_str()),
+            Some("yolo")
+        );
     }
 
     #[test]
@@ -2087,8 +2219,8 @@ You review code."#;
         );
     }
 
-    #[test]
-    fn test_validate_delegate_params_rejects_zero_max_turns() {
+    #[tokio::test]
+    async fn test_validate_delegate_params_rejects_zero_max_turns() {
         let context = create_test_context();
         let client = SummonClient::new(context).unwrap();
 
@@ -2101,8 +2233,8 @@ You review code."#;
         assert_eq!(result, Err("'max_turns' must be at least 1".to_string()));
     }
 
-    #[test]
-    fn test_validate_delegate_params_accepts_positive_max_turns() {
+    #[tokio::test]
+    async fn test_validate_delegate_params_accepts_positive_max_turns() {
         let context = create_test_context();
         let client = SummonClient::new(context).unwrap();
 
@@ -2114,9 +2246,155 @@ You review code."#;
         assert!(client.validate_delegate_params(&params).is_ok());
     }
 
+    #[tokio::test]
+    async fn test_agent_permission_profile_is_carried_from_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let agents = temp_dir.path().join(".goose/agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("writer.md"),
+            "---\nname: writer\npermission_profile: yolo\n---\nWrite only when explicitly requested.",
+        )
+        .unwrap();
+
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let built = client
+            .build_source_recipe(
+                "writer",
+                &DelegateParams::default(),
+                "test",
+                temp_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(built.source_permission_profile, Some(GooseMode::Yolo));
+        assert_eq!(
+            SummonClient::resolve_permission_profile(
+                &DelegateParams::default(),
+                built.source_permission_profile
+            )
+            .unwrap(),
+            GooseMode::Yolo
+        );
+    }
+
     #[test]
+    fn test_subagent_permission_profile_priority_and_rejections() {
+        assert_eq!(
+            SummonClient::resolve_permission_profile(&DelegateParams::default(), None).unwrap(),
+            GooseMode::Readonly
+        );
+        assert_eq!(
+            SummonClient::resolve_permission_profile(
+                &DelegateParams::default(),
+                Some(GooseMode::Yolo)
+            )
+            .unwrap(),
+            GooseMode::Yolo
+        );
+        assert_eq!(
+            SummonClient::resolve_permission_profile(
+                &DelegateParams {
+                    permission_profile: Some(GooseMode::Readonly),
+                    ..Default::default()
+                },
+                Some(GooseMode::Yolo)
+            )
+            .unwrap(),
+            GooseMode::Readonly
+        );
+        assert_eq!(
+            SummonClient::resolve_permission_profile(
+                &DelegateParams {
+                    permission_profile: Some(GooseMode::Guarded),
+                    ..Default::default()
+                },
+                None
+            )
+            .unwrap(),
+            GooseMode::Guarded
+        );
+        assert_eq!(
+            SummonClient::resolve_permission_profile(
+                &DelegateParams {
+                    permission_profile: Some(GooseMode::Standard),
+                    ..Default::default()
+                },
+                None
+            )
+            .unwrap(),
+            GooseMode::Standard
+        );
+        assert!(SummonClient::resolve_permission_profile(
+            &DelegateParams {
+                permission_profile: Some(GooseMode::Approve),
+                ..Default::default()
+            },
+            None
+        )
+        .unwrap_err()
+        .contains("Legacy auto/approve/smart_approve aliases"));
+        assert!(SummonClient::resolve_permission_profile(
+            &DelegateParams {
+                permission_profile: Some(GooseMode::SmartApprove),
+                ..Default::default()
+            },
+            None
+        )
+        .unwrap_err()
+        .contains("Legacy auto/approve/smart_approve aliases"));
+        assert!(SummonClient::resolve_permission_profile(
+            &DelegateParams {
+                permission_profile: Some(GooseMode::Auto),
+                ..Default::default()
+            },
+            None
+        )
+        .unwrap_err()
+        .contains("Legacy auto/approve/smart_approve aliases"));
+    }
+
+    #[tokio::test]
+    async fn test_async_delegate_rejects_approval_based_permission_profile() {
+        let context = create_test_context();
+        let parent_session = context
+            .session_manager
+            .create_session(
+                std::env::current_dir().unwrap(),
+                "parent".to_string(),
+                SessionType::User,
+                GooseMode::Standard,
+            )
+            .await
+            .unwrap();
+        context
+            .session_manager
+            .update(&parent_session.id)
+            .provider_name("static-test".to_string())
+            .model_config(ModelConfig::new_or_fail("static-model"))
+            .apply()
+            .await
+            .unwrap();
+
+        let client = SummonClient::new(context).unwrap();
+        let params = DelegateParams {
+            instructions: Some("try a write task".to_string()),
+            permission_profile: Some(GooseMode::Standard),
+            r#async: true,
+            ..Default::default()
+        };
+
+        let err = client
+            .handle_async_delegate(&parent_session.id, Some("parent_req".to_string()), params)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Async delegated tasks cannot use approval-based"));
+    }
+
+    #[tokio::test]
     #[serial]
-    fn test_resolve_max_turns_recipe_overrides_env_var() {
+    async fn test_resolve_max_turns_recipe_overrides_env_var() {
         let context = create_test_context();
         let client = SummonClient::new(context).unwrap();
 
@@ -2155,9 +2433,9 @@ You review code."#;
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_max_turns_falls_back_to_env_var() {
+    async fn test_resolve_max_turns_falls_back_to_env_var() {
         let context = create_test_context();
         let client = SummonClient::new(context).unwrap();
 
@@ -2173,9 +2451,9 @@ You review code."#;
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_max_turns_falls_back_to_default() {
+    async fn test_resolve_max_turns_falls_back_to_default() {
         let context = create_test_context();
         let client = SummonClient::new(context).unwrap();
 
@@ -2297,6 +2575,15 @@ You review code."#;
             RawContent::Text(t) => t.text.as_str(),
             _ => panic!("Expected text content"),
         }
+    }
+
+    async fn subscribe_with_capacity(
+        client: &SummonClient,
+        capacity: usize,
+    ) -> mpsc::Receiver<ServerNotification> {
+        let (tx, rx) = mpsc::channel(capacity);
+        client.notification_subscribers.lock().await.push(tx);
+        rx
     }
 
     #[test]
@@ -2448,6 +2735,53 @@ You review code."#;
 
         // All tasks consumed -- moim should be empty
         assert!(client.get_moim("test").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_notification_bridge_drops_slow_subscriber_without_blocking_healthy_one() {
+        use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam, Notification};
+
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let _slow_subscriber = subscribe_with_capacity(&client, 1).await;
+        let mut healthy_subscriber = subscribe_with_capacity(&client, 4).await;
+        let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+
+        SummonClient::spawn_notification_bridge_with_timeout(
+            notif_rx,
+            Arc::clone(&client.notification_subscribers),
+            Arc::clone(&buffer),
+            Duration::from_millis(20),
+        );
+
+        for idx in 1..=3 {
+            notif_tx
+                .send(ServerNotification::LoggingMessageNotification(
+                    Notification::new(LoggingMessageNotificationParam::new(
+                        LoggingLevel::Info,
+                        serde_json::json!({ "idx": idx }),
+                    )),
+                ))
+                .unwrap();
+        }
+
+        let mut ids = Vec::new();
+        for _ in 1..=3 {
+            let notif = tokio::time::timeout(Duration::from_secs(1), healthy_subscriber.recv())
+                .await
+                .unwrap()
+                .expect("healthy subscriber notification");
+            ids.push(match notif {
+                ServerNotification::LoggingMessageNotification(log) => log.params.data["idx"]
+                    .as_i64()
+                    .expect("idx should be integer"),
+                _ => panic!("expected logging notification"),
+            });
+        }
+        assert_eq!(ids, vec![1, 2, 3]);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(client.notification_subscribers.lock().await.len(), 1);
+        assert!(buffer.lock().await.is_empty());
     }
 
     #[tokio::test]

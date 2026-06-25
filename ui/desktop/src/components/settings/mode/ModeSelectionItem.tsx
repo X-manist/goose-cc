@@ -3,8 +3,41 @@ import { Gear } from '../../icons';
 import { ConfigureApproveMode } from './ConfigureApproveMode';
 import PermissionRulesModal from '../permission/PermissionRulesModal';
 import { defineMessages, useIntl } from '../../../i18n';
+import type { GooseMode as GooseModeValue } from '../../../api/types.gen';
 
 const i18n = defineMessages({
+  readonlyLabel: {
+    id: 'modeSelectionItem.readonlyLabel',
+    defaultMessage: 'Read-only',
+  },
+  readonlyDescription: {
+    id: 'modeSelectionItem.readonlyDescription',
+    defaultMessage: 'Only read-only tools can run without modifying files or system state.',
+  },
+  guardedLabel: {
+    id: 'modeSelectionItem.guardedLabel',
+    defaultMessage: 'Guarded',
+  },
+  guardedDescription: {
+    id: 'modeSelectionItem.guardedDescription',
+    defaultMessage: 'Allow clearly safe reads and ask before sensitive actions.',
+  },
+  standardLabel: {
+    id: 'modeSelectionItem.standardLabel',
+    defaultMessage: 'Standard',
+  },
+  standardDescription: {
+    id: 'modeSelectionItem.standardDescription',
+    defaultMessage: 'Ask before every tool call.',
+  },
+  yoloLabel: {
+    id: 'modeSelectionItem.yoloLabel',
+    defaultMessage: 'Unrestricted',
+  },
+  yoloDescription: {
+    id: 'modeSelectionItem.yoloDescription',
+    defaultMessage: 'Approve tool calls without prompts. Use only in isolated worktrees.',
+  },
   autonomousLabel: {
     id: 'modeSelectionItem.autonomousLabel',
     defaultMessage: 'Autonomous',
@@ -37,15 +70,39 @@ const i18n = defineMessages({
     id: 'modeSelectionItem.chatOnlyDescription',
     defaultMessage: 'Engage with the selected provider without using tools or extensions.',
   },
+  configureRules: {
+    id: 'modeSelectionItem.configureRules',
+    defaultMessage: 'Configure permission rules for {mode}',
+  },
 });
 
 export interface GooseMode {
-  key: string;
+  key: GooseModeValue;
   labelDescriptor: { id: string; defaultMessage: string };
   descriptionDescriptor: { id: string; defaultMessage: string };
 }
 
 export const all_goose_modes: GooseMode[] = [
+  {
+    key: 'readonly',
+    labelDescriptor: i18n.readonlyLabel,
+    descriptionDescriptor: i18n.readonlyDescription,
+  },
+  {
+    key: 'guarded',
+    labelDescriptor: i18n.guardedLabel,
+    descriptionDescriptor: i18n.guardedDescription,
+  },
+  {
+    key: 'standard',
+    labelDescriptor: i18n.standardLabel,
+    descriptionDescriptor: i18n.standardDescription,
+  },
+  {
+    key: 'yolo',
+    labelDescriptor: i18n.yoloLabel,
+    descriptionDescriptor: i18n.yoloDescription,
+  },
   {
     key: 'auto',
     labelDescriptor: i18n.autonomousLabel,
@@ -68,12 +125,29 @@ export const all_goose_modes: GooseMode[] = [
   },
 ];
 
+export const permission_profile_modes: GooseMode[] = all_goose_modes.filter((mode) =>
+  ['readonly', 'guarded', 'standard', 'yolo'].includes(mode.key)
+);
+
+export const legacy_goose_modes: GooseMode[] = all_goose_modes.filter(
+  (mode) => !permission_profile_modes.some((profile) => profile.key === mode.key)
+);
+
+const permissionConfigurableModes: GooseModeValue[] = [
+  'readonly',
+  'guarded',
+  'standard',
+  'yolo',
+  'approve',
+  'smart_approve',
+];
+
 interface ModeSelectionItemProps {
-  currentMode: string;
+  currentMode: GooseModeValue;
   mode: GooseMode;
   showDescription: boolean;
   isApproveModeConfigure: boolean;
-  handleModeChange: (newMode: string) => void;
+  handleModeChange: (newMode: GooseModeValue) => void;
 }
 
 export const ModeSelectionItem = forwardRef<HTMLDivElement, ModeSelectionItemProps>(
@@ -82,6 +156,9 @@ export const ModeSelectionItem = forwardRef<HTMLDivElement, ModeSelectionItemPro
     const [checked, setChecked] = useState(currentMode == mode.key);
     const [isDialogOpen, setIsDialogOpen] = useState(false);
     const [isPermissionModalOpen, setIsPermissionModalOpen] = useState(false);
+    const label = intl.formatMessage(mode.labelDescriptor);
+    const canConfigurePermissions =
+      !isApproveModeConfigure && permissionConfigurableModes.includes(mode.key);
 
     useEffect(() => {
       setChecked(currentMode === mode.key);
@@ -92,10 +169,19 @@ export const ModeSelectionItem = forwardRef<HTMLDivElement, ModeSelectionItemPro
         <div
           className={`flex items-center justify-between text-text-primary py-2 px-2 ${checked ? 'bg-background-secondary' : 'bg-background-primary hover:bg-background-secondary'} rounded-lg transition-all`}
           onClick={() => handleModeChange(mode.key)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              handleModeChange(mode.key);
+            }
+          }}
+          role="radio"
+          aria-checked={checked}
+          tabIndex={0}
         >
           <div className="flex">
             <div>
-              <h3 className="text-text-primary">{intl.formatMessage(mode.labelDescriptor)}</h3>
+              <h3 className="text-text-primary">{label}</h3>
               {showDescription && (
                 <p className="text-text-secondary mt-[2px]">{intl.formatMessage(mode.descriptionDescriptor)}</p>
               )}
@@ -103,8 +189,10 @@ export const ModeSelectionItem = forwardRef<HTMLDivElement, ModeSelectionItemPro
           </div>
 
           <div className="relative flex items-center gap-2">
-            {!isApproveModeConfigure && (mode.key == 'approve' || mode.key == 'smart_approve') && (
+            {canConfigurePermissions && (
               <button
+                type="button"
+                aria-label={intl.formatMessage(i18n.configureRules, { mode: label })}
                 onClick={(e) => {
                   e.stopPropagation(); // Prevent triggering the mode change
                   setIsPermissionModalOpen(true);

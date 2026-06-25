@@ -60,9 +60,13 @@ impl ProviderDef for PiAcpProvider {
 
             let mode_mapping = HashMap::from([
                 (GooseMode::Auto, "auto".to_string()),
+                (GooseMode::Yolo, "auto".to_string()),
                 (GooseMode::Approve, "approve".to_string()),
+                (GooseMode::Standard, "approve".to_string()),
                 (GooseMode::SmartApprove, "smart-approve".to_string()),
+                (GooseMode::Guarded, "smart-approve".to_string()),
                 (GooseMode::Chat, "chat".to_string()),
+                (GooseMode::Readonly, "chat".to_string()),
             ]);
 
             let provider_config = AcpProviderConfig {

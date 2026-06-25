@@ -466,7 +466,8 @@ impl Provider for AcpProvider {
             .lock()
             .map_err(|_| ProviderError::RequestFailed("goose_mode lock poisoned".into()))?;
 
-        let reject_all_tools = goose_mode == GooseMode::Chat;
+        let reject_all_tools =
+            goose_mode.is_chat_only() || goose_mode.effective_mode() == GooseMode::Readonly;
         let model_name = model_config.model_name.clone();
 
         Ok(Box::pin(try_stream! {
@@ -1510,10 +1511,13 @@ fn resolve_mode(
 }
 
 fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDecision> {
-    match goose_mode {
+    match goose_mode.effective_mode() {
         GooseMode::Auto => Some(PermissionDecision::AllowOnce),
-        GooseMode::Chat => Some(PermissionDecision::RejectOnce),
+        GooseMode::Chat | GooseMode::Readonly => Some(PermissionDecision::RejectOnce),
         GooseMode::Approve | GooseMode::SmartApprove => None,
+        GooseMode::Guarded | GooseMode::Standard | GooseMode::Yolo => {
+            unreachable!("ACP permission decision should match on effective goose mode")
+        }
     }
 }
 
@@ -1805,6 +1809,10 @@ mod tests {
     #[test_case(GooseMode::Chat => Some(PermissionDecision::RejectOnce) ; "chat rejects")]
     #[test_case(GooseMode::Approve => None ; "approve defers")]
     #[test_case(GooseMode::SmartApprove => None ; "smart_approve defers")]
+    #[test_case(GooseMode::Readonly => Some(PermissionDecision::RejectOnce) ; "readonly rejects")]
+    #[test_case(GooseMode::Guarded => None ; "guarded defers")]
+    #[test_case(GooseMode::Standard => None ; "standard defers")]
+    #[test_case(GooseMode::Yolo => Some(PermissionDecision::AllowOnce) ; "yolo allows")]
     fn test_permission_decision_from_mode(mode: GooseMode) -> Option<PermissionDecision> {
         permission_decision_from_mode(mode)
     }

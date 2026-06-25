@@ -1,7 +1,17 @@
+use crate::permission::permission_confirmation::PrincipalType;
+use crate::permission::{Permission, PermissionConfirmation};
 use crate::{
-    agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
+    agents::{
+        subagent_task_config::TaskConfig,
+        tool_confirmation_router::{
+            delegated_tool_confirmation_id, register_delegated_tool_confirmation,
+            schedule_unregister_delegated_tool_confirmations_for_subagent,
+            unregister_delegated_tool_confirmations_for_subagent,
+        },
+        Agent, AgentConfig, AgentEvent, SessionConfig,
+    },
     conversation::{
-        message::{Message, MessageContent},
+        message::{ActionRequiredData, Message, MessageContent},
         Conversation,
     },
     prompt_template::render_template,
@@ -34,15 +44,45 @@ pub struct SubagentPromptContext {
 type AgentMessagesFuture =
     Pin<Box<dyn Future<Output = Result<(Conversation, Option<String>)>> + Send>>;
 
+struct DelegatedConfirmationCleanup {
+    subagent_id: String,
+    active: bool,
+}
+
+impl DelegatedConfirmationCleanup {
+    fn new(subagent_id: String) -> Self {
+        Self {
+            subagent_id,
+            active: true,
+        }
+    }
+
+    async fn finish(mut self) {
+        unregister_delegated_tool_confirmations_for_subagent(&self.subagent_id).await;
+        self.active = false;
+    }
+}
+
+impl Drop for DelegatedConfirmationCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            schedule_unregister_delegated_tool_confirmations_for_subagent(self.subagent_id.clone());
+        }
+    }
+}
+
 pub struct SubagentRunParams {
     pub config: AgentConfig,
     pub recipe: Recipe,
     pub task_config: TaskConfig,
     pub return_last_only: bool,
+    pub parent_session_id: String,
+    pub parent_tool_request_id: Option<String>,
     pub session_id: String,
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    pub approval_forwarding: bool,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
@@ -118,6 +158,7 @@ fn extract_response_text(messages: &Conversation, return_last_only: bool) -> Str
 }
 
 pub const SUBAGENT_TOOL_REQUEST_TYPE: &str = "subagent_tool_request";
+pub const SUBAGENT_TOOL_CONFIRMATION_TYPE: &str = "subagent_tool_confirmation";
 
 fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
     Box::pin(async move {
@@ -125,10 +166,13 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             config,
             recipe,
             task_config,
+            parent_session_id,
+            parent_tool_request_id,
             session_id,
             cancellation_token,
             on_message,
             notification_tx,
+            approval_forwarding,
             ..
         } = params;
 
@@ -178,6 +222,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             max_turns: task_config.max_turns.map(|v| v as u32),
             retry_config: recipe.retry,
         };
+        let confirmation_cleanup = DelegatedConfirmationCleanup::new(session_id.clone());
 
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
@@ -190,12 +235,33 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         while let Some(message_result) = stream.next().await {
             match message_result {
-                Ok(AgentEvent::Message(msg)) => {
+                Ok(AgentEvent::Message(mut msg)) => {
+                    rewrite_tool_confirmations_for_parent(
+                        &mut msg,
+                        &parent_session_id,
+                        &session_id,
+                        agent.tool_confirmation_router.clone(),
+                        approval_forwarding,
+                    )
+                    .await;
                     if let Some(ref callback) = on_message {
                         callback(&msg);
                     }
                     if let Some(ref tx) = notification_tx {
                         for content in &msg.content {
+                            if let Some(notif) = create_tool_confirmation_notification(
+                                content,
+                                &session_id,
+                                parent_tool_request_id.as_deref(),
+                                approval_forwarding,
+                            ) {
+                                if tx.send(notif).is_err() {
+                                    debug!(
+                                        "Notification receiver dropped for subagent {}",
+                                        session_id
+                                    );
+                                }
+                            }
                             if let Some(notif) = create_tool_notification(content, &session_id) {
                                 if tx.send(notif).is_err() {
                                     debug!(
@@ -219,10 +285,50 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             }
         }
 
+        confirmation_cleanup.finish().await;
+
         let final_output = get_final_output(&agent, has_response_schema).await;
 
         Ok((conversation, final_output))
     })
+}
+
+async fn rewrite_tool_confirmations_for_parent(
+    msg: &mut Message,
+    parent_session_id: &str,
+    subagent_id: &str,
+    child_router: crate::agents::tool_confirmation_router::ToolConfirmationRouter,
+    approval_forwarding: bool,
+) {
+    for content in &mut msg.content {
+        if let MessageContent::ActionRequired(action_required) = content {
+            if let ActionRequiredData::ToolConfirmation { id, .. } = &mut action_required.data {
+                let child_request_id = id.clone();
+                if !approval_forwarding {
+                    let _ = child_router
+                        .deliver(
+                            child_request_id,
+                            PermissionConfirmation {
+                                principal_type: PrincipalType::Tool,
+                                permission: Permission::DenyOnce,
+                            },
+                        )
+                        .await;
+                    continue;
+                }
+                let delegated_id = delegated_tool_confirmation_id(subagent_id, &child_request_id);
+                register_delegated_tool_confirmation(
+                    parent_session_id.to_string(),
+                    subagent_id.to_string(),
+                    delegated_id.clone(),
+                    child_request_id,
+                    child_router.clone(),
+                )
+                .await;
+                *id = delegated_id;
+            }
+        }
+    }
 }
 
 async fn build_subagent_prompt(
@@ -297,10 +403,55 @@ pub fn create_tool_notification(
     }
 }
 
+pub fn create_tool_confirmation_notification(
+    content: &MessageContent,
+    subagent_id: &str,
+    parent_tool_request_id: Option<&str>,
+    approval_forwarding: bool,
+) -> Option<ServerNotification> {
+    if !approval_forwarding {
+        return None;
+    }
+    if let MessageContent::ActionRequired(action_required) = content {
+        if let ActionRequiredData::ToolConfirmation {
+            id,
+            tool_name,
+            arguments,
+            prompt,
+        } = &action_required.data
+        {
+            return Some(ServerNotification::LoggingMessageNotification(
+                Notification::new(
+                    LoggingMessageNotificationParam::new(
+                        LoggingLevel::Info,
+                        serde_json::json!({
+                        "type": SUBAGENT_TOOL_CONFIRMATION_TYPE,
+                        "subagent_id": subagent_id,
+                        "parent_tool_request_id": parent_tool_request_id,
+                        "id": id,
+                        "tool_name": tool_name,
+                            "arguments": arguments,
+                            "prompt": prompt
+                        }),
+                    )
+                    .with_logger(format!("subagent:{}", subagent_id)),
+                ),
+            ));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{create_tool_notification, SUBAGENT_TOOL_REQUEST_TYPE};
-    use crate::conversation::message::MessageContent;
+    use super::{
+        create_tool_confirmation_notification, create_tool_notification,
+        rewrite_tool_confirmations_for_parent, DelegatedConfirmationCleanup,
+        SUBAGENT_TOOL_CONFIRMATION_TYPE, SUBAGENT_TOOL_REQUEST_TYPE,
+    };
+    use crate::conversation::message::{Message, MessageContent};
+    use crate::permission::permission_confirmation::PrincipalType;
+    use crate::permission::{Permission, PermissionConfirmation};
     use rmcp::model::{CallToolRequestParams, ServerNotification};
     use serde_json::json;
 
@@ -342,5 +493,158 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+
+    #[test]
+    fn create_tool_confirmation_notification_for_subagent_action_required() {
+        let content = MessageContent::action_required(
+            "subagent:session_1:req1",
+            "developer__shell".to_string(),
+            serde_json::json!({"command": "touch x"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            Some("confirm shell".to_string()),
+        );
+        let notification =
+            create_tool_confirmation_notification(&content, "session_1", Some("parent_req"), true)
+                .expect("expected notification");
+
+        let ServerNotification::LoggingMessageNotification(log_notif) = notification else {
+            panic!("expected logging notification");
+        };
+        let data = log_notif
+            .params
+            .data
+            .as_object()
+            .expect("expected object data");
+        assert_eq!(
+            data.get("type").and_then(|v| v.as_str()),
+            Some(SUBAGENT_TOOL_CONFIRMATION_TYPE)
+        );
+        assert_eq!(
+            data.get("id").and_then(|v| v.as_str()),
+            Some("subagent:session_1:req1")
+        );
+        assert_eq!(
+            data.get("parent_tool_request_id").and_then(|v| v.as_str()),
+            Some("parent_req")
+        );
+        assert_eq!(
+            data.get("tool_name").and_then(|v| v.as_str()),
+            Some("developer__shell")
+        );
+    }
+
+    #[test]
+    fn create_tool_confirmation_notification_skips_when_forwarding_disabled() {
+        let content = MessageContent::action_required(
+            "req1",
+            "developer__shell".to_string(),
+            serde_json::Map::new(),
+            None,
+        );
+        assert!(create_tool_confirmation_notification(
+            &content,
+            "session_1",
+            Some("parent_req"),
+            false
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn rewrite_tool_confirmations_for_parent_registers_forwarded_id() {
+        let router = crate::agents::tool_confirmation_router::ToolConfirmationRouter::new();
+        let child_rx = router.register("req1".to_string()).await;
+        let mut message = Message::assistant().with_action_required(
+            "req1",
+            "developer__shell".to_string(),
+            serde_json::Map::new(),
+            None,
+        );
+
+        rewrite_tool_confirmations_for_parent(&mut message, "parent1", "sub1", router, true).await;
+
+        let action = message.content[0].as_action_required().unwrap();
+        let crate::conversation::message::ActionRequiredData::ToolConfirmation { id, .. } =
+            &action.data
+        else {
+            panic!("expected tool confirmation");
+        };
+        assert_eq!(id, "subagent:sub1:req1");
+        assert!(
+            crate::agents::tool_confirmation_router::deliver_delegated_tool_confirmation(
+                "parent1",
+                id.as_str(),
+                PermissionConfirmation {
+                    principal_type: PrincipalType::Tool,
+                    permission: Permission::AllowOnce,
+                },
+            )
+            .await
+        );
+        assert_eq!(child_rx.await.unwrap().permission, Permission::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn delegated_confirmation_cleanup_removes_pending_routes_on_drop() {
+        let router = crate::agents::tool_confirmation_router::ToolConfirmationRouter::new();
+        let _child_rx = router.register("req_cleanup".to_string()).await;
+        let mut message = Message::assistant().with_action_required(
+            "req_cleanup",
+            "developer__shell".to_string(),
+            serde_json::Map::new(),
+            None,
+        );
+
+        rewrite_tool_confirmations_for_parent(&mut message, "parent1", "sub_cleanup", router, true)
+            .await;
+        let action = message.content[0].as_action_required().unwrap();
+        let crate::conversation::message::ActionRequiredData::ToolConfirmation { id, .. } =
+            &action.data
+        else {
+            panic!("expected tool confirmation");
+        };
+        assert_eq!(id, "subagent:sub_cleanup:req_cleanup");
+
+        let cleanup = DelegatedConfirmationCleanup::new("sub_cleanup".to_string());
+        drop(cleanup);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            !crate::agents::tool_confirmation_router::deliver_delegated_tool_confirmation(
+                "parent1",
+                id.as_str(),
+                PermissionConfirmation {
+                    principal_type: PrincipalType::Tool,
+                    permission: Permission::AllowOnce,
+                },
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_tool_confirmations_for_parent_denies_when_forwarding_disabled() {
+        let router = crate::agents::tool_confirmation_router::ToolConfirmationRouter::new();
+        let child_rx = router.register("req1".to_string()).await;
+        let mut message = Message::assistant().with_action_required(
+            "req1",
+            "developer__shell".to_string(),
+            serde_json::Map::new(),
+            None,
+        );
+
+        rewrite_tool_confirmations_for_parent(&mut message, "parent1", "sub1", router, false).await;
+
+        let action = message.content[0].as_action_required().unwrap();
+        let crate::conversation::message::ActionRequiredData::ToolConfirmation { id, .. } =
+            &action.data
+        else {
+            panic!("expected tool confirmation");
+        };
+        assert_eq!(id, "req1");
+        assert_eq!(child_rx.await.unwrap().permission, Permission::DenyOnce);
     }
 }

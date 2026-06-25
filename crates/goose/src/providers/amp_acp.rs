@@ -62,10 +62,14 @@ impl ProviderDef for AmpAcpProvider {
             let mode_mapping = HashMap::from([
                 // "bypass" skips confirmations, closest to autonomous mode.
                 (GooseMode::Auto, "bypass".to_string()),
+                (GooseMode::Yolo, "bypass".to_string()),
                 // "default" prompts before risky actions.
                 (GooseMode::Approve, "default".to_string()),
+                (GooseMode::Standard, "default".to_string()),
                 (GooseMode::SmartApprove, "default".to_string()),
+                (GooseMode::Guarded, "default".to_string()),
                 (GooseMode::Chat, "default".to_string()),
+                (GooseMode::Readonly, "default".to_string()),
             ]);
 
             let provider_config = AcpProviderConfig {

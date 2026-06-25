@@ -4574,6 +4574,7 @@ dependencies = [
  "futures",
  "gethostname",
  "goose-acp-macros",
+ "goose-context-core",
  "goose-mcp",
  "goose-providers",
  "goose-sdk-types",
@@ -4736,6 +4737,17 @@ dependencies = [
  "webbrowser",
  "winapi",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "goose-context-core"
+version = "1.37.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

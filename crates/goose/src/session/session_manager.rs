@@ -6,7 +6,7 @@ use crate::model::ModelConfig;
 use crate::providers::base::{Provider, MSG_COUNT_FOR_SESSION_NAME_GENERATION};
 use crate::recipe::Recipe;
 use crate::session::extension_data::ExtensionData;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rmcp::model::Role;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use utoipa::ToSchema;
 pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
+const ARTIFACTS_FOLDER: &str = "artifacts";
 
 #[derive(
     Debug,
@@ -380,6 +381,10 @@ impl SessionManager {
         &self.storage
     }
 
+    pub fn artifact_dir(&self, session_id: &str) -> PathBuf {
+        self.storage.artifact_dir(session_id)
+    }
+
     pub async fn create_session(
         &self,
         working_dir: PathBuf,
@@ -696,6 +701,12 @@ impl SessionStorage {
             initialized: tokio::sync::OnceCell::new(),
             session_dir,
         }
+    }
+
+    pub fn artifact_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir
+            .join(ARTIFACTS_FOLDER)
+            .join(goose_context_core::stable_segment(session_id))
     }
 
     pub(crate) async fn pool(&self) -> Result<&Pool<Sqlite>> {
@@ -1735,6 +1746,17 @@ impl SessionStorage {
             .await?;
 
         tx.commit().await?;
+
+        let artifact_dir = self.artifact_dir(session_id);
+        if artifact_dir.exists() {
+            fs::remove_dir_all(&artifact_dir).with_context(|| {
+                format!(
+                    "failed to remove session artifact directory {}",
+                    artifact_dir.display()
+                )
+            })?;
+        }
+
         Ok(())
     }
 

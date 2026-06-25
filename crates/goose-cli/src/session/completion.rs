@@ -165,8 +165,21 @@ impl GooseCompleter {
             "/prompt",
             "/mode",
             "/model",
+            "/plan",
+            "/endplan",
             "/recipe",
+            "/compact",
+            "/doctor",
+            "/status",
+            "/cost",
+            "/debug",
+            "/review",
+            "/resume",
+            "/worktree",
+            "/edit",
+            "/r",
             "/skills",
+            "/clear",
         ];
 
         // Find commands that match the prefix
@@ -577,6 +590,40 @@ mod tests {
         let (pos, candidates) = completer.complete_slash_commands("/").unwrap();
         assert_eq!(pos, 0);
         assert!(candidates.len() > 1);
+
+        // Test newly added session commands
+        let (_, candidates) = completer.complete_slash_commands("/st").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/status");
+
+        let (_, candidates) = completer.complete_slash_commands("/co").unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display == "/cost"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display == "/compact"));
+
+        let (_, candidates) = completer.complete_slash_commands("/deb").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/debug");
+
+        let (_, candidates) = completer.complete_slash_commands("/doc").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/doctor");
+
+        let (_, candidates) = completer.complete_slash_commands("/rev").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/review");
+
+        let (_, candidates) = completer.complete_slash_commands("/res").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/resume");
+
+        let (_, candidates) = completer.complete_slash_commands("/work").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/worktree");
 
         // Test no match
         let (_pos, candidates) = completer.complete_slash_commands("/nonexistent").unwrap();

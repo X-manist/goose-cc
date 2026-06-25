@@ -45,6 +45,9 @@ export default function ToolConfirmation({
           ? intl.formatMessage(i18n.allowToolCallWithName, { toolName: displayName })
           : intl.formatMessage(i18n.gooseWouldLikeToCallWithName, { toolName: displayName })}
       </div>
+      {prompt && (
+        <div className="px-4 pt-3 text-sm whitespace-pre-wrap text-text-secondary">{prompt}</div>
+      )}
       <ToolApprovalButtons
         data={{ id, toolName, prompt: prompt ?? undefined, sessionId, isClicked }}
       />

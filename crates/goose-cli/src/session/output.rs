@@ -1414,7 +1414,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     );
 }
 
-fn estimate_cost_usd(
+pub fn estimate_cost_usd(
     provider: &str,
     model: &str,
     input_tokens: usize,

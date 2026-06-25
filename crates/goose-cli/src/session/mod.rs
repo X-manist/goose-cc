@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -172,6 +173,7 @@ pub struct CliSession {
     edit_mode: Option<EditMode>,
     retry_config: Option<RetryConfig>,
     output_format: String,
+    quiet: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +252,7 @@ impl CliSession {
         edit_mode: Option<EditMode>,
         retry_config: Option<RetryConfig>,
         output_format: String,
+        quiet: bool,
     ) -> Self {
         let messages = agent
             .config
@@ -271,6 +274,7 @@ impl CliSession {
             edit_mode,
             retry_config,
             output_format,
+            quiet,
         }
     }
 
@@ -470,6 +474,10 @@ impl CliSession {
         interactive: bool,
     ) -> Result<()> {
         let cancel_token = cancel_token.clone();
+        if message.role == rmcp::model::Role::User {
+            self.maybe_auto_start_worktree(&message.as_concat_text())
+                .await?;
+        }
         self.push_message(message);
         self.process_agent_response(interactive, cancel_token)
             .await?;
@@ -635,6 +643,34 @@ impl CliSession {
                 history.save(editor);
                 self.handle_compact().await?;
             }
+            InputResult::Status => {
+                history.save(editor);
+                self.handle_status().await?;
+            }
+            InputResult::Cost => {
+                history.save(editor);
+                self.handle_cost().await?;
+            }
+            InputResult::Debug(value) => {
+                history.save(editor);
+                self.handle_debug(value);
+            }
+            InputResult::Doctor => {
+                history.save(editor);
+                self.handle_doctor().await?;
+            }
+            InputResult::Review(opts) => {
+                history.save(editor);
+                self.handle_review(opts).await?;
+            }
+            InputResult::Resume(opts) => {
+                history.save(editor);
+                self.handle_resume(opts).await?;
+            }
+            InputResult::Worktree(opts) => {
+                history.save(editor);
+                self.handle_worktree(opts).await?;
+            }
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -685,6 +721,7 @@ impl CliSession {
         match self.run_mode {
             RunMode::Normal => {
                 history.save(editor);
+                self.maybe_auto_start_worktree(content).await?;
                 self.push_message(Message::user().with_text(content));
 
                 if let Err(e) = crate::project_tracker::update_project_tracker(
@@ -719,6 +756,110 @@ impl CliSession {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn maybe_auto_start_worktree(&mut self, content: &str) -> Result<()> {
+        if !auto_worktree_enabled() || !should_auto_worktree_for_prompt(content) {
+            return Ok(());
+        }
+
+        let mode = self.agent.goose_mode().await;
+        if mode.is_chat_only() || matches!(mode, GooseMode::Readonly) {
+            return Ok(());
+        }
+
+        let cwd = std::env::current_dir()?;
+        match goose::worktree::is_goose_worktree(&cwd) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(_) => {
+                println!(
+                    "{}",
+                    console::style("Auto worktree skipped: not inside a git repository.").dim()
+                );
+                return Ok(());
+            }
+        }
+        if goose::worktree::is_linked_worktree(&cwd).unwrap_or(false) {
+            if !self.quiet {
+                println!(
+                    "{}",
+                    console::style("Already in a git worktree; continuing there.").dim()
+                );
+            }
+            return Ok(());
+        }
+
+        let label = auto_worktree_label(content);
+        match goose::worktree::plan_worktree(&cwd, &self.session_id, Some(&label), None).and_then(
+            |plan| {
+                goose::worktree::create_worktree(&plan)?;
+                Ok(plan)
+            },
+        ) {
+            Ok(plan) => {
+                if let Err(e) = self.activate_worktree_dir(&plan.worktree_dir).await {
+                    if let Err(cleanup_err) =
+                        goose::worktree::remove_worktree(&plan.repo_root, &plan.worktree_dir)
+                    {
+                        output::render_error(&format!(
+                            "Auto worktree activation failed: {e}. Cleanup also failed: {cleanup_err}"
+                        ));
+                    } else {
+                        output::render_error(&format!(
+                            "Auto worktree activation failed; cleaned up created worktree: {e}"
+                        ));
+                    }
+                    return Ok(());
+                }
+
+                if !self.quiet {
+                    println!(
+                        "{}",
+                        console::style("Auto worktree enabled for this long task.").green()
+                    );
+                    println!("  branch: {}", plan.branch);
+                    println!("  path: {}", plan.worktree_dir.display());
+                    println!(
+                        "  {}",
+                        console::style(
+                            "This session now uses the worktree as its working directory."
+                        )
+                        .dim()
+                    );
+                }
+            }
+            Err(e) => {
+                if !self.quiet {
+                    output::render_error(&format!(
+                        "Auto worktree setup failed; continuing in current directory: {e}"
+                    ));
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        "Auto worktree setup failed; continuing in current directory"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn activate_worktree_dir(&mut self, worktree_dir: &Path) -> Result<()> {
+        self.agent
+            .config
+            .session_manager
+            .update(&self.session_id)
+            .working_dir(worktree_dir.to_path_buf())
+            .apply()
+            .await?;
+        std::env::set_current_dir(worktree_dir)?;
+        self.agent
+            .extension_manager
+            .update_working_dir(worktree_dir)
+            .await;
+        self.update_completion_cache().await?;
         Ok(())
     }
 
@@ -1034,6 +1175,295 @@ impl CliSession {
         Ok(())
     }
 
+    async fn handle_status(&self) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        let provider_name = provider.get_name().to_string();
+        let model_config = provider.get_model_config();
+        let session = self.get_session().await?;
+        let mode = self.agent.goose_mode().await;
+        let message_count = self.messages.len();
+        let context_limit = model_config.context_limit();
+        let total_tokens = session
+            .accumulated_total_tokens
+            .or(session.total_tokens)
+            .unwrap_or(0);
+        let input_tokens = session
+            .accumulated_input_tokens
+            .or(session.input_tokens)
+            .unwrap_or(0);
+        let output_tokens = session
+            .accumulated_output_tokens
+            .or(session.output_tokens)
+            .unwrap_or(0);
+        let usage_pct = if context_limit > 0 {
+            (total_tokens as f64 / context_limit as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!("{}", console::style("Session status").bold());
+        println!("  session: {}", self.session_id);
+        println!("  mode: {mode}");
+        println!("  provider: {provider_name}");
+        println!("  model: {}", model_config.model_name);
+        println!("  messages: {message_count}");
+        println!(
+            "  tokens: total {} · input {} · output {} · context {:.1}%",
+            total_tokens, input_tokens, output_tokens, usage_pct
+        );
+        if let Some(cost) = session.accumulated_cost {
+            println!("  recorded cost: ${cost:.4}");
+        }
+        Ok(())
+    }
+
+    async fn handle_cost(&self) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        let provider_name = provider.get_name().to_string();
+        let model_config = provider.get_model_config();
+        let session = self.get_session().await?;
+        let input_tokens = session
+            .accumulated_input_tokens
+            .or(session.input_tokens)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let output_tokens = session
+            .accumulated_output_tokens
+            .or(session.output_tokens)
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        if let Some(recorded_cost) = session.accumulated_cost {
+            println!(
+                "Recorded session cost: ${:.4} ({} input, {} output tokens)",
+                recorded_cost, input_tokens, output_tokens
+            );
+            return Ok(());
+        }
+
+        match output::estimate_cost_usd(
+            &provider_name,
+            &model_config.model_name,
+            input_tokens,
+            output_tokens,
+        ) {
+            Some(cost) => {
+                println!(
+                    "Estimated session cost: ${:.4} ({} input, {} output tokens)",
+                    cost, input_tokens, output_tokens
+                );
+            }
+            None => {
+                println!(
+                    "Cost unavailable for provider '{}' model '{}'. Tokens: {} input, {} output.",
+                    provider_name, model_config.model_name, input_tokens, output_tokens
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_debug(&mut self, value: Option<bool>) {
+        self.debug = value.unwrap_or(!self.debug);
+        let state = if self.debug { "enabled" } else { "disabled" };
+        println!(
+            "{}",
+            console::style(format!("Debug rendering {state}.")).dim()
+        );
+    }
+
+    async fn handle_doctor(&self) -> Result<()> {
+        self.handle_status().await?;
+        println!(
+            "  {}",
+            console::style("For full setup diagnostics, run `goose doctor` from your shell.").dim()
+        );
+        Ok(())
+    }
+
+    async fn handle_review(
+        &mut self,
+        mut opts: crate::commands::review::ReviewOptions,
+    ) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        if opts.provider.is_none() {
+            opts.provider = Some(provider.get_name().to_string());
+        }
+        if opts.default_model.is_none() {
+            opts.default_model = Some(provider.get_model_config().model_name);
+        }
+        println!(
+            "{}",
+            console::style("Running review for current diff...").cyan()
+        );
+        crate::commands::review::handle_review(opts).await
+    }
+
+    async fn find_resume_session(
+        &self,
+        target: Option<&str>,
+    ) -> Result<Option<goose::session::Session>> {
+        let manager = &self.agent.config.session_manager;
+        let Some(target) = target else {
+            let sessions = manager.list_sessions().await?;
+            let Some(session) = sessions.into_iter().find(|s| s.id != self.session_id) else {
+                return Ok(None);
+            };
+            return Ok(Some(manager.get_session(&session.id, true).await?));
+        };
+
+        if let Ok(session) = manager.get_session(target, true).await {
+            return Ok(Some(session));
+        }
+
+        let sessions = manager.list_all_sessions().await?;
+        let Some(session) = sessions.into_iter().find(|s| s.name == target) else {
+            return Ok(None);
+        };
+        Ok(Some(manager.get_session(&session.id, true).await?))
+    }
+
+    async fn handle_resume(&mut self, opts: input::ResumeCommandOptions) -> Result<()> {
+        let Some(session) = self.find_resume_session(opts.target.as_deref()).await? else {
+            let target = opts.target.as_deref().unwrap_or("latest session");
+            output::render_error(&format!("No session found for {target}."));
+            return Ok(());
+        };
+
+        if session.id == self.session_id {
+            println!(
+                "{}",
+                console::style(format!("Already using session {}.", session.id)).dim()
+            );
+            return Ok(());
+        }
+
+        if !session.working_dir.exists() {
+            output::render_error(&format!(
+                "Session working directory no longer exists: {}",
+                session.working_dir.display()
+            ));
+            return Ok(());
+        }
+
+        if let Err(e) = std::env::set_current_dir(&session.working_dir) {
+            output::render_error(&format!(
+                "Failed to switch to session working directory {}: {}",
+                session.working_dir.display(),
+                e
+            ));
+            return Ok(());
+        }
+
+        self.session_id = session.id.clone();
+        self.messages = session.conversation.clone().unwrap_or_default();
+        self.run_mode = RunMode::Normal;
+        self.agent
+            .update_goose_mode(session.goose_mode, &self.session_id)
+            .await?;
+
+        if let (Some(provider_name), Some(model_config)) = (
+            session.provider_name.as_deref(),
+            session.model_config.clone(),
+        ) {
+            if let Err(e) = self
+                .agent
+                .recreate_provider_for_session(&self.session_id, provider_name, model_config)
+                .await
+            {
+                output::render_error(&format!(
+                    "Resumed session, but failed to recreate saved provider '{}': {}",
+                    provider_name, e
+                ));
+            }
+        } else {
+            println!(
+                "{}",
+                console::style(
+                    "Resumed session with current provider because no saved provider/model was recorded."
+                )
+                .yellow()
+            );
+        }
+
+        self.agent
+            .extension_manager
+            .update_working_dir(&session.working_dir)
+            .await;
+        let extension_results = self.agent.restore_extensions_from_session(&session).await;
+        let failed_extensions: Vec<_> = extension_results
+            .iter()
+            .filter(|result| !result.success)
+            .collect();
+        for result in failed_extensions {
+            output::render_error(&format!(
+                "Failed to restore extension '{}': {}",
+                result.name,
+                result.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        self.update_completion_cache().await?;
+
+        println!(
+            "\n  {} {}",
+            console::style("↻").cyan(),
+            console::style(format!(
+                "resumed session {} · {}",
+                self.session_id,
+                session.working_dir.display()
+            ))
+            .dim()
+        );
+        if opts.history {
+            self.render_message_history();
+        }
+        Ok(())
+    }
+
+    async fn handle_worktree(&mut self, opts: input::WorktreeCommandOptions) -> Result<()> {
+        match opts.command {
+            input::WorktreeCommand::Status => {
+                let cwd = std::env::current_dir()?;
+                match goose::worktree::list_worktrees(&cwd) {
+                    Ok(infos) => {
+                        if infos.is_empty() {
+                            println!("No git worktrees found.");
+                        } else {
+                            println!("{}", console::style("Git worktrees").bold());
+                            for info in infos {
+                                let branch = info.branch.unwrap_or_else(|| "(detached)".into());
+                                println!("  {branch:<32} {}", info.path.display());
+                            }
+                        }
+                    }
+                    Err(e) => output::render_error(&format!("Worktree status failed: {e}")),
+                }
+            }
+            input::WorktreeCommand::Start => {
+                let cwd = std::env::current_dir()?;
+                let label = opts.label.as_deref().unwrap_or("task");
+                let plan = goose::worktree::plan_worktree(
+                    &cwd,
+                    &self.session_id,
+                    Some(label),
+                    opts.base_ref.as_deref(),
+                )?;
+                goose::worktree::create_worktree(&plan)?;
+                self.activate_worktree_dir(&plan.worktree_dir).await?;
+                println!("{}", console::style("Isolated worktree created.").green());
+                println!("  repo: {}", plan.repo_root.display());
+                println!("  branch: {}", plan.branch);
+                println!("  path: {}", plan.worktree_dir.display());
+                println!(
+                    "  {}",
+                    console::style("This session now uses the worktree as its working directory.")
+                        .dim()
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn plan_with_reasoner_model(
         &mut self,
         plan_messages: Conversation,
@@ -1084,8 +1514,14 @@ impl CliSession {
                     // set goose mode: auto if that isn't already the case
                     let config = Config::global();
                     let curr_goose_mode = config.get_goose_mode().unwrap_or_default();
-                    if curr_goose_mode != GooseMode::Auto {
+                    let curr_session_goose_mode = self.agent.goose_mode().await;
+                    if !curr_goose_mode.is_autonomous() {
                         config.set_goose_mode(GooseMode::Auto).unwrap();
+                    }
+                    if !curr_session_goose_mode.is_autonomous() {
+                        self.agent
+                            .update_goose_mode(GooseMode::Auto, &self.session_id)
+                            .await?;
                     }
 
                     // clear the messages before acting on the plan
@@ -1100,8 +1536,13 @@ impl CliSession {
                     output::hide_thinking();
 
                     // Reset run & goose mode
-                    if curr_goose_mode != GooseMode::Auto {
+                    if !curr_goose_mode.is_autonomous() {
                         config.set_goose_mode(curr_goose_mode)?;
+                    }
+                    if !curr_session_goose_mode.is_autonomous() {
+                        self.agent
+                            .update_goose_mode(curr_session_goose_mode, &self.session_id)
+                            .await?;
                     }
                 } else {
                     // add the plan response (assistant message) & carry the conversation forward
@@ -1192,7 +1633,7 @@ impl CliSession {
                                     // bypass the safety contract those modes are meant to enforce.
                                     let config = Config::global();
                                     let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
-                                    if goose_mode == GooseMode::Approve || goose_mode == GooseMode::SmartApprove {
+                                    if goose_mode.is_approval_required() {
                                         cancel_token_clone.cancel();
                                         drop(stream);
                                         return Err(anyhow::anyhow!(
@@ -1209,10 +1650,15 @@ impl CliSession {
 
                                 if permission == Permission::Cancel {
                                     output::render_text("Tool call cancelled. Returning to chat...", Some(Color::Yellow), true);
-                                    self.agent.handle_confirmation(id.clone(), PermissionConfirmation {
+                                    let delivered = self.agent.handle_confirmation(&self.session_id, id.clone(), PermissionConfirmation {
                                         principal_type: PrincipalType::Tool,
                                         permission: Permission::DenyOnce,
                                     }).await;
+                                    if !delivered {
+                                        output::render_error(
+                                            "Tool confirmation could not be delivered; the request may have expired."
+                                        );
+                                    }
                                     let mut response_message = Message::user();
                                     response_message.content.push(MessageContent::tool_response(
                                         id,
@@ -1227,10 +1673,15 @@ impl CliSession {
                                     drop(stream);
                                     break;
                                 }
-                                self.agent.handle_confirmation(id, PermissionConfirmation {
+                                let delivered = self.agent.handle_confirmation(&self.session_id, id, PermissionConfirmation {
                                     principal_type: PrincipalType::Tool,
                                     permission,
                                 }).await;
+                                if !delivered {
+                                    output::render_error(
+                                        "Tool confirmation could not be delivered; the request may have expired."
+                                    );
+                                }
                             } else if let Some((elicitation_id, elicitation_message, schema)) = find_elicitation_request(&message) {
                                 if !interactive {
                                     // Non-interactive/headless mode: cannot collect user input
@@ -1808,6 +2259,115 @@ fn find_tool_confirmation(message: &Message) -> Option<(String, Option<String>)>
     })
 }
 
+fn auto_worktree_enabled() -> bool {
+    match std::env::var("GOOSE_AUTO_WORKTREE") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn should_auto_worktree_for_prompt(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let readonly_terms = [
+        "只读",
+        "readonly",
+        "read-only",
+        "review only",
+        "分析一下",
+        "解释一下",
+        "查看一下",
+        "总结一下",
+    ];
+    if readonly_terms.iter().any(|term| trimmed.contains(term)) {
+        return false;
+    }
+
+    let task_terms = [
+        "实现",
+        "开发",
+        "修复",
+        "调试",
+        "测试",
+        "部署",
+        "重构",
+        "优化",
+        "改造",
+        "迁移",
+        "端到端",
+        "长任务",
+        "小游戏",
+        "e2e",
+        "implement",
+        "build",
+        "fix",
+        "debug",
+        "test",
+        "deploy",
+        "refactor",
+        "migrate",
+        "feature",
+    ];
+    let has_task_term = task_terms.iter().any(|term| trimmed.contains(term));
+    if !has_task_term {
+        return false;
+    }
+
+    let high_confidence_write_terms = [
+        "修复",
+        "开发",
+        "实现",
+        "部署",
+        "重构",
+        "改造",
+        "迁移",
+        "fix",
+        "implement",
+        "deploy",
+        "refactor",
+        "migrate",
+    ];
+    if high_confidence_write_terms
+        .iter()
+        .any(|term| trimmed.contains(term))
+    {
+        return true;
+    }
+
+    trimmed.chars().count() >= 24
+        || task_terms
+            .iter()
+            .filter(|term| trimmed.contains(*term))
+            .count()
+            >= 2
+}
+
+fn auto_worktree_label(prompt: &str) -> String {
+    let words = prompt
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("-");
+    let sanitized = goose::worktree::sanitize_segment(&words);
+    if sanitized != "task" {
+        return sanitized;
+    }
+
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in prompt.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("task-{:06x}", hash & 0x00ff_ffff)
+}
+
 /// Extract elicitation request from a message
 fn find_elicitation_request(message: &Message) -> Option<(String, String, Value)> {
     message.content.iter().find_map(|content| {
@@ -2186,6 +2746,31 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn auto_worktree_heuristic_targets_long_write_tasks() {
+        assert!(should_auto_worktree_for_prompt(
+            "实现 approval-based subagent，并继续调试测试直到通过"
+        ));
+        assert!(should_auto_worktree_for_prompt(
+            "Please implement the new feature and run e2e tests across the app"
+        ));
+        assert!(should_auto_worktree_for_prompt("修复构建失败"));
+        assert!(!should_auto_worktree_for_prompt("解释一下这个函数做什么"));
+        assert!(!should_auto_worktree_for_prompt("只读分析一下目前架构风险"));
+        assert!(!should_auto_worktree_for_prompt("status"));
+    }
+
+    #[test]
+    fn auto_worktree_label_is_sanitized() {
+        assert_eq!(
+            auto_worktree_label("Implement approval/router: phase 2"),
+            "implement-approval-router-phase-2"
+        );
+        let label = auto_worktree_label("修复构建失败");
+        assert!(label.starts_with("task-"));
+        assert!(label.len() > "task-".len());
+    }
 
     #[test]
     fn test_format_elapsed_time_under_60_seconds() {

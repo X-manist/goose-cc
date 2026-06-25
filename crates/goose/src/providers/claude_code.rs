@@ -352,7 +352,7 @@ impl ClaudeCodeProvider {
         let config = Config::global();
         let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
 
-        match goose_mode {
+        match goose_mode.effective_mode() {
             GooseMode::Auto => {
                 cmd.arg("--dangerously-skip-permissions");
                 Ok(false)
@@ -361,7 +361,10 @@ impl ClaudeCodeProvider {
                 cmd.arg("--permission-prompt-tool").arg("stdio");
                 Ok(true)
             }
-            GooseMode::Chat => Ok(false),
+            GooseMode::Chat | GooseMode::Readonly => Ok(false),
+            GooseMode::Guarded | GooseMode::Standard | GooseMode::Yolo => {
+                unreachable!("claude code permission flags should match on effective goose mode")
+            }
         }
     }
 

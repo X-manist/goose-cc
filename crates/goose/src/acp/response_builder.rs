@@ -160,7 +160,7 @@ pub(super) fn build_mode_state(
     current_mode: GooseMode,
 ) -> Result<SessionModeState, agent_client_protocol::Error> {
     let mut available = Vec::with_capacity(GooseMode::VARIANTS.len());
-    for &name in GooseMode::VARIANTS {
+    for &name in GooseMode::DISPLAY_VARIANTS {
         let goose_mode: GooseMode = name.parse().map_err(|_| {
             agent_client_protocol::Error::internal_error() // impossible but satisfy linters
                 .data(format!("Failed to parse GooseMode variant: {}", name))
@@ -392,38 +392,43 @@ mod tests {
         build_model_state("unused", &inventory)
     }
 
+    fn expected_session_modes() -> Vec<SessionMode> {
+        GooseMode::DISPLAY_VARIANTS
+            .iter()
+            .map(|&name| {
+                let goose_mode: GooseMode = name.parse().expect("valid GooseMode variant");
+                let mut mode = SessionMode::new(SessionModeId::new(name), name);
+                mode.description = goose_mode.get_message().map(Into::into);
+                mode
+            })
+            .collect()
+    }
+
+    fn expected_mode_state(current_mode: GooseMode) -> SessionModeState {
+        SessionModeState::new(
+            SessionModeId::new(current_mode.to_string()),
+            expected_session_modes(),
+        )
+    }
+
+    fn expected_mode_select_options() -> Vec<SessionConfigSelectOption> {
+        expected_session_modes()
+            .into_iter()
+            .map(|mode| {
+                SessionConfigSelectOption::new(mode.id.0.clone(), mode.name.clone())
+                    .description(mode.description.clone())
+            })
+            .collect()
+    }
+
     #[test_case(
         GooseMode::Auto
-        => Ok(SessionModeState::new(
-            SessionModeId::new("auto"),
-            vec![
-                SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Automatically approve tool calls"),
-                SessionMode::new(SessionModeId::new("approve"), "approve")
-                    .description("Ask before every tool call"),
-                SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
-                    .description("Ask only for sensitive tool calls"),
-                SessionMode::new(SessionModeId::new("chat"), "chat")
-                    .description("Chat only, no tool calls"),
-            ],
-        ))
+        => Ok(expected_mode_state(GooseMode::Auto))
         ; "auto mode"
     )]
     #[test_case(
         GooseMode::Approve
-        => Ok(SessionModeState::new(
-            SessionModeId::new("approve"),
-            vec![
-                SessionMode::new(SessionModeId::new("auto"), "auto")
-                    .description("Automatically approve tool calls"),
-                SessionMode::new(SessionModeId::new("approve"), "approve")
-                    .description("Ask before every tool call"),
-                SessionMode::new(SessionModeId::new("smart_approve"), "smart_approve")
-                    .description("Ask only for sensitive tool calls"),
-                SessionMode::new(SessionModeId::new("chat"), "chat")
-                    .description("Chat only, no tool calls"),
-            ],
-        ))
+        => Ok(expected_mode_state(GooseMode::Approve))
         ; "approve mode"
     )]
     fn test_build_mode_state(
@@ -453,12 +458,7 @@ mod tests {
             ),
             SessionConfigOption::select(
                 "mode", "Mode", "auto",
-                vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
-                    SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
-                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
-                    SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
-                ],
+                expected_mode_select_options(),
             ).category(SessionConfigOptionCategory::Mode),
             SessionConfigOption::select(
                 "model", "Model", "gpt-4",
@@ -488,12 +488,7 @@ mod tests {
             ),
             SessionConfigOption::select(
                 "mode", "Mode", "approve",
-                vec![
-                    SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
-                    SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
-                    SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
-                    SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
-                ],
+                expected_mode_select_options(),
             ).category(SessionConfigOptionCategory::Mode),
             SessionConfigOption::select(
                 "model", "Model", "only-model",

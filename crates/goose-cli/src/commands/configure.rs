@@ -1323,6 +1323,26 @@ pub fn configure_goose_mode_dialog() -> anyhow::Result<()> {
 
     let mode = cliclack::select("Which goose mode would you like to configure?")
         .item(
+            GooseMode::Readonly,
+            "Readonly Mode",
+            "Only read-only tools are allowed; write or destructive tools are denied"
+        )
+        .item(
+            GooseMode::Guarded,
+            "Guarded Mode",
+            "Ask only for sensitive tool calls"
+        )
+        .item(
+            GooseMode::Standard,
+            "Standard Mode",
+            "Ask before every non-read-only tool call"
+        )
+        .item(
+            GooseMode::Yolo,
+            "Yolo Mode",
+            "Approve tool calls without prompts"
+        )
+        .item(
             GooseMode::Auto,
             "Auto Mode",
             "Full file modification, extension usage, edit, create and delete files freely"
@@ -1346,6 +1366,10 @@ pub fn configure_goose_mode_dialog() -> anyhow::Result<()> {
 
     config.set_goose_mode(mode)?;
     let msg = match mode {
+        GooseMode::Readonly => "Set to Readonly Mode - only read-only tools are allowed",
+        GooseMode::Guarded => "Set to Guarded Mode - sensitive operations require approval",
+        GooseMode::Standard => "Set to Standard Mode - tool calls require approval",
+        GooseMode::Yolo => "Set to Yolo Mode - full file modification enabled",
         GooseMode::Auto => "Set to Auto Mode - full file modification enabled",
         GooseMode::Approve => "Set to Approve Mode - all tools and modifications require approval",
         GooseMode::SmartApprove => "Set to Smart Approve Mode - modifications require approval",

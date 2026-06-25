@@ -28,6 +28,7 @@ fn default_principal_type() -> PrincipalType {
     request_body = ConfirmToolActionRequest,
     responses(
         (status = 200, description = "Tool confirmation action is confirmed", body = Value),
+        (status = 404, description = "Tool confirmation request was not found or expired", body = ErrorResponse),
         (status = 401, description = "Unauthorized - invalid secret key"),
         (status = 500, description = "Internal server error")
     )
@@ -36,10 +37,12 @@ pub async fn confirm_tool_action(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ConfirmToolActionRequest>,
 ) -> Result<Json<Value>, ErrorResponse> {
-    let agent = state.get_agent_for_route(request.session_id).await?;
+    let session_id = request.session_id.clone();
+    let agent = state.get_agent_for_route(session_id.clone()).await?;
 
-    agent
+    let delivered = agent
         .handle_confirmation(
+            &session_id,
             request.id.clone(),
             PermissionConfirmation {
                 principal_type: request.principal_type,
@@ -47,6 +50,12 @@ pub async fn confirm_tool_action(
             },
         )
         .await;
+
+    if !delivered {
+        return Err(ErrorResponse::not_found(
+            "Tool confirmation request was not found or has expired",
+        ));
+    }
 
     Ok(Json(Value::Object(serde_json::Map::new())))
 }
@@ -71,7 +80,7 @@ mod tests {
         use tower::ServiceExt;
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn test_tool_confirmation_endpoint() {
+        async fn test_tool_confirmation_endpoint_returns_not_found_for_unknown_request() {
             let state = AppState::new(true).await.unwrap();
 
             let app = routes(state);
@@ -94,7 +103,7 @@ mod tests {
 
             let response = app.oneshot(request).await.unwrap();
 
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 }

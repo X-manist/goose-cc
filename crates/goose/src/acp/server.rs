@@ -1782,6 +1782,7 @@ impl GooseAcpAgent {
         let cx = cx.clone();
         let agent = agent.clone();
         let session_id = session_id.clone();
+        let session_id_string = session_id.to_string();
 
         let formatted_name = format_tool_name(&tool_name);
 
@@ -1819,18 +1820,23 @@ impl GooseAcpAgent {
             .on_receiving_result(move |result| async move {
                 match result {
                     Ok(response) => {
-                        agent
+                        let delivered = agent
                             .handle_confirmation(
+                                &session_id_string,
                                 request_id,
                                 outcome_to_confirmation(&response.outcome),
                             )
                             .await;
+                        if !delivered {
+                            error!("failed to deliver permission confirmation");
+                        }
                         Ok(())
                     }
                     Err(e) => {
                         error!(error = ?e, "permission request failed");
-                        agent
+                        let delivered = agent
                             .handle_confirmation(
+                                &session_id_string,
                                 request_id,
                                 PermissionConfirmation {
                                     principal_type: PrincipalType::Tool,
@@ -1838,6 +1844,9 @@ impl GooseAcpAgent {
                                 },
                             )
                             .await;
+                        if !delivered {
+                            error!("failed to deliver cancellation confirmation");
+                        }
                         Ok(())
                     }
                 }

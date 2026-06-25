@@ -3,6 +3,7 @@ import { Card } from '../../ui/card';
 import { Button } from '../../ui/button';
 import { GooseMode, ModeSelectionItem } from './ModeSelectionItem';
 import { defineMessages, useIntl } from '../../../i18n';
+import type { GooseMode as GooseModeValue } from '../../../api/types.gen';
 
 const i18n = defineMessages({
   title: {
@@ -21,6 +22,14 @@ const i18n = defineMessages({
     id: 'configureApproveMode.manualApprovalDescription',
     defaultMessage: 'All tools, extensions and file modifications will require human approval',
   },
+  standardApproval: {
+    id: 'configureApproveMode.standardApproval',
+    defaultMessage: 'Standard',
+  },
+  standardApprovalDescription: {
+    id: 'configureApproveMode.standardApprovalDescription',
+    defaultMessage: 'Ask before every tool call.',
+  },
   smartApproval: {
     id: 'configureApproveMode.smartApproval',
     defaultMessage: 'Smart approval',
@@ -28,6 +37,14 @@ const i18n = defineMessages({
   smartApprovalDescription: {
     id: 'configureApproveMode.smartApprovalDescription',
     defaultMessage: 'Intelligently determine which actions need approval based on risk level',
+  },
+  guardedApproval: {
+    id: 'configureApproveMode.guardedApproval',
+    defaultMessage: 'Guarded',
+  },
+  guardedApprovalDescription: {
+    id: 'configureApproveMode.guardedApprovalDescription',
+    defaultMessage: 'Allow clearly safe reads and ask before sensitive actions.',
   },
   saving: {
     id: 'configureApproveMode.saving',
@@ -45,8 +62,8 @@ const i18n = defineMessages({
 
 interface ConfigureApproveModeProps {
   onClose: () => void;
-  handleModeChange: (newMode: string) => void;
-  currentMode: string | null;
+  handleModeChange: (newMode: GooseModeValue) => void;
+  currentMode: GooseModeValue;
 }
 
 export function ConfigureApproveMode({
@@ -56,6 +73,16 @@ export function ConfigureApproveMode({
 }: ConfigureApproveModeProps) {
   const intl = useIntl();
   const approveModes: GooseMode[] = [
+    {
+      key: 'guarded',
+      labelDescriptor: i18n.guardedApproval,
+      descriptionDescriptor: i18n.guardedApprovalDescription,
+    },
+    {
+      key: 'standard',
+      labelDescriptor: i18n.standardApproval,
+      descriptionDescriptor: i18n.standardApprovalDescription,
+    },
     {
       key: 'approve',
       labelDescriptor: i18n.manualApproval,
@@ -69,7 +96,7 @@ export function ConfigureApproveMode({
   ];
 
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [approveMode, setApproveMode] = useState(currentMode);
+  const [approveMode, setApproveMode] = useState<GooseModeValue>(currentMode);
 
   useEffect(() => {
     setApproveMode(currentMode);
@@ -80,7 +107,7 @@ export function ConfigureApproveMode({
 
     setIsSubmitting(true);
     try {
-      handleModeChange(approveMode || '');
+      handleModeChange(approveMode);
       onClose();
     } catch (error) {
       console.error('Error configuring goose mode:', error);
@@ -108,7 +135,7 @@ export function ConfigureApproveMode({
                   key={mode.key}
                   mode={mode}
                   showDescription={true}
-                  currentMode={approveMode || ''}
+                  currentMode={approveMode}
                   isApproveModeConfigure={true}
                   handleModeChange={(newMode) => {
                     setApproveMode(newMode);

@@ -135,10 +135,28 @@ impl ToolInspector for PermissionInspector {
         for request in tool_requests {
             if let Ok(tool_call) = &request.tool_call {
                 let tool_name = &tool_call.name;
+                let effective_mode = goose_mode.effective_mode();
 
-                let action = match goose_mode {
+                let action = match effective_mode {
                     GooseMode::Chat => continue,
                     GooseMode::Auto => InspectionAction::Allow,
+                    GooseMode::Readonly => {
+                        // Readonly is a security boundary: only explicit local metadata can allow
+                        // a tool, and user deny/ask rules still take precedence. Do not use LLM
+                        // classification here because generic tools require argument-level review.
+                        match permission_manager.get_user_permission(tool_name) {
+                            Some(PermissionLevel::NeverAllow) => InspectionAction::Deny,
+                            Some(PermissionLevel::AskBefore)
+                                if self.is_readonly_annotated_tool(tool_name) =>
+                            {
+                                InspectionAction::RequireApproval(None)
+                            }
+                            _ if self.is_readonly_annotated_tool(tool_name) => {
+                                InspectionAction::Allow
+                            }
+                            _ => InspectionAction::Deny,
+                        }
+                    }
                     GooseMode::Approve | GooseMode::SmartApprove => {
                         // 1. Check user-defined permission first
                         if let Some(level) = permission_manager.get_user_permission(tool_name) {
@@ -151,7 +169,7 @@ impl ToolInspector for PermissionInspector {
                             }
                         // 2. Check if it's a smart-approved tool (annotation or cached LLM decision)
                         } else if self.is_readonly_annotated_tool(tool_name)
-                            || (goose_mode == GooseMode::SmartApprove
+                            || (effective_mode == GooseMode::SmartApprove
                                 && permission_manager.get_smart_approve_permission(tool_name)
                                     == Some(PermissionLevel::AlwaysAllow))
                         {
@@ -162,7 +180,7 @@ impl ToolInspector for PermissionInspector {
                                 "Extension management requires approval for security".to_string(),
                             ))
                         // 4. Defer to LLM detection (SmartApprove, not yet cached)
-                        } else if goose_mode == GooseMode::SmartApprove
+                        } else if effective_mode == GooseMode::SmartApprove
                             && permission_manager
                                 .get_smart_approve_permission(tool_name)
                                 .is_none()
@@ -174,15 +192,20 @@ impl ToolInspector for PermissionInspector {
                             InspectionAction::RequireApproval(None)
                         }
                     }
+                    GooseMode::Guarded | GooseMode::Standard | GooseMode::Yolo => {
+                        unreachable!("permission inspector should match on effective goose mode")
+                    }
                 };
 
                 let reason = match &action {
                     InspectionAction::Allow => {
-                        if goose_mode == GooseMode::Auto {
+                        if effective_mode == GooseMode::Auto {
                             "Auto mode - all tools approved".to_string()
+                        } else if effective_mode == GooseMode::Readonly {
+                            "Readonly mode - tool is read-only".to_string()
                         } else if self.is_readonly_annotated_tool(tool_name) {
                             "Tool annotated as read-only".to_string()
-                        } else if goose_mode == GooseMode::SmartApprove {
+                        } else if effective_mode == GooseMode::SmartApprove {
                             "SmartApprove cached as read-only".to_string()
                         } else {
                             "User permission allows this tool".to_string()
@@ -209,7 +232,8 @@ impl ToolInspector for PermissionInspector {
             }
         }
 
-        // LLM-based read-only detection for deferred SmartApprove candidates
+        // LLM-based read-only detection for deferred SmartApprove candidates only. Readonly never
+        // defers to the model for permission decisions.
         if !llm_detect_candidates.is_empty() {
             let detected: HashSet<String> = match self.provider.lock().await.clone() {
                 Some(provider) => {
@@ -238,15 +262,20 @@ impl ToolInspector for PermissionInspector {
                     permission_manager.update_smart_approve_permission(&tc.name, level);
                 }
 
+                let effective_mode = goose_mode.effective_mode();
                 results.push(InspectionResult {
                     tool_request_id: candidate.id.clone(),
                     action: if is_readonly {
                         InspectionAction::Allow
+                    } else if effective_mode == GooseMode::Readonly {
+                        InspectionAction::Deny
                     } else {
                         InspectionAction::RequireApproval(None)
                     },
                     reason: if is_readonly {
                         "LLM detected as read-only".to_string()
+                    } else if effective_mode == GooseMode::Readonly {
+                        "Readonly mode denies non-read-only tools".to_string()
                     } else {
                         "Tool requires user approval".to_string()
                     },
@@ -277,6 +306,14 @@ mod tests {
     #[test_case(GooseMode::SmartApprove, false, None, InspectionAction::RequireApproval(None); "smart_approve_unknown_defers")]
     #[test_case(GooseMode::Approve, false, None, InspectionAction::RequireApproval(None); "approve_requires_approval")]
     #[test_case(GooseMode::Approve, false, Some(PermissionLevel::AlwaysAllow), InspectionAction::RequireApproval(None); "approve_ignores_cache")]
+    #[test_case(GooseMode::Readonly, true, None, InspectionAction::Allow; "readonly_annotation_allows")]
+    #[test_case(GooseMode::Readonly, false, None, InspectionAction::Deny; "readonly_unknown_denies")]
+    #[test_case(GooseMode::Readonly, true, Some(PermissionLevel::NeverAllow), InspectionAction::Deny; "readonly_user_never_allow_overrides_annotation")]
+    #[test_case(GooseMode::Readonly, true, Some(PermissionLevel::AskBefore), InspectionAction::RequireApproval(None); "readonly_user_ask_before_overrides_annotation")]
+    #[test_case(GooseMode::Readonly, false, Some(PermissionLevel::AlwaysAllow), InspectionAction::Deny; "readonly_user_always_allow_does_not_allow_unannotated_tool")]
+    #[test_case(GooseMode::Guarded, true, None, InspectionAction::Allow; "guarded_alias_annotation_allows")]
+    #[test_case(GooseMode::Standard, false, None, InspectionAction::RequireApproval(None); "standard_alias_requires_approval")]
+    #[test_case(GooseMode::Yolo, false, None, InspectionAction::Allow; "yolo_alias_allows")]
     #[tokio::test]
     async fn test_inspect_action(
         mode: GooseMode,
@@ -286,7 +323,11 @@ mod tests {
     ) {
         let pm = Arc::new(PermissionManager::new(tempfile::tempdir().unwrap().keep()));
         if let Some(level) = cache {
-            pm.update_smart_approve_permission("tool", level);
+            if mode.effective_mode() == GooseMode::Readonly {
+                pm.update_user_permission("tool", level);
+            } else {
+                pm.update_smart_approve_permission("tool", level);
+            }
         }
         let inspector = PermissionInspector::new(pm, Arc::new(Mutex::new(None)));
         if smart_approved {

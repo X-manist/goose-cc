@@ -12,6 +12,7 @@ use goose::source_roots::SourceRoot;
 use goose_mcp::mcp_server_runner::{serve, McpCommand};
 use goose_mcp::{AutoVisualiserRouter, ComputerControllerServer, MemoryServer, TutorialServer};
 
+use crate::commands::agent_import::{handle_agent_import, AgentImportCliOptions};
 #[cfg(feature = "telemetry")]
 use crate::commands::configure::configure_telemetry_consent_dialog;
 use crate::commands::configure::handle_configure;
@@ -583,6 +584,65 @@ enum SessionCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum AgentCommand {
+    #[command(about = "Import tools, config, memory, and sessions from another coding agent")]
+    Import {
+        #[arg(help = "Source agent: codex, claude-code, cursor, aider, or pi")]
+        source: String,
+
+        #[arg(
+            long = "from",
+            value_name = "PATH",
+            help = "Source agent config root. Defaults to the standard home-directory location for the source agent."
+        )]
+        source_root: Option<PathBuf>,
+
+        #[arg(
+            long = "working-dir",
+            value_name = "PATH",
+            help = "Project directory for local rules and local goose memory."
+        )]
+        working_dir: Option<PathBuf>,
+
+        #[arg(
+            long = "dry-run",
+            help = "Print what would be imported without writing anything"
+        )]
+        dry_run: bool,
+
+        #[arg(long = "no-sessions", help = "Skip JSONL session transcript import")]
+        no_sessions: bool,
+
+        #[arg(
+            long = "session-limit",
+            default_value_t = 20,
+            help = "Maximum number of session transcripts to import unless --all-sessions is set"
+        )]
+        session_limit: usize,
+
+        #[arg(
+            long = "all-sessions",
+            help = "Import all discovered session transcripts"
+        )]
+        all_sessions: bool,
+
+        #[arg(
+            long = "activate-model",
+            help = "Switch goose's active provider/model to the imported source profile"
+        )]
+        activate_model: bool,
+
+        #[arg(
+            long = "format",
+            value_name = "FORMAT",
+            default_value = "text",
+            help = "Output format: text or json"
+        )]
+        format: String,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum SchedulerCommand {
     #[command(about = "Add a new scheduled job")]
@@ -885,6 +945,13 @@ enum Command {
     /// Open the last project directory
     #[command(about = "Open the last project directory", visible_alias = "p")]
     Project {},
+
+    /// Import tools, config, memory, and sessions from other coding agents
+    #[command(about = "Import another coding agent environment")]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
 
     /// List recent project directories
     #[command(about = "List recent project directories", visible_alias = "ps")]
@@ -1287,6 +1354,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
         Some(Command::Project {}) => "project",
+        Some(Command::Agent { .. }) => "agent",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Gateway { .. }) => "gateway",
@@ -1453,6 +1521,38 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn handle_agent_subcommand(command: AgentCommand) -> Result<()> {
+    match command {
+        AgentCommand::Import {
+            source,
+            source_root,
+            working_dir,
+            dry_run,
+            no_sessions,
+            session_limit,
+            all_sessions,
+            activate_model,
+            format,
+        } => {
+            handle_agent_import(AgentImportCliOptions {
+                source,
+                source_root,
+                working_dir,
+                dry_run,
+                include_sessions: !no_sessions,
+                session_limit: if all_sessions {
+                    None
+                } else {
+                    Some(session_limit)
+                },
+                activate_model,
+                format,
+            })
+            .await
+        }
+    }
 }
 
 async fn handle_interactive_session(
@@ -2134,6 +2234,7 @@ pub async fn cli() -> anyhow::Result<()> {
             handle_project_default()?;
             Ok(())
         }
+        Some(Command::Agent { command }) => handle_agent_subcommand(command).await,
         Some(Command::Projects) => {
             handle_projects_interactive()?;
             Ok(())
